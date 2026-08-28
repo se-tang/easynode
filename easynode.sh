@@ -4,13 +4,12 @@
 # EasyNode
 # VPS 一键节点部署工具
 #
-# Version: 1.0
+# Version: 1.1 (NAT 小内存机器优化版)
 #################################################
 
 set -e
 
-
-VERSION="1.0"
+VERSION="1.1"
 
 
 #############################################
@@ -29,15 +28,16 @@ RESET="\033[0m"
 
 BASE_DIR="/etc/easynode"
 
+# SSH 断开保护：忽略挂断信号（SIGHUP），防止 SSH 断线导致脚本中断
+trap '' HUP
+
 
 #############################################
 # Logo
 #############################################
 
 show_logo(){
-
 clear
-
 echo "
 ====================================
         EasyNode v${VERSION}
@@ -46,9 +46,7 @@ echo "
 
 ====================================
 "
-
 }
-
 
 
 #############################################
@@ -56,18 +54,11 @@ echo "
 #############################################
 
 check_root(){
-
 if [ "$EUID" -ne 0 ]; then
-
     echo -e "${RED}请使用 root 用户运行${RESET}"
-
     exit 1
-
 fi
-
-
 }
-
 
 
 #############################################
@@ -75,70 +66,37 @@ fi
 #############################################
 
 detect_os(){
-
 echo
 echo "正在检测系统..."
 echo
 
-
 if [ ! -f /etc/os-release ]; then
-
     echo "无法识别系统"
-
     exit 1
-
 fi
 
-
 source /etc/os-release
-
 
 OS=$ID
 VERSION_ID=$VERSION_ID
 
-
 echo -e "系统: ${GREEN}$PRETTY_NAME${RESET}"
 
-
 case $OS in
-
-debian)
-
+debian|ubuntu)
     PKG="apt"
-
     ;;
-
-
-ubuntu)
-
-    PKG="apt"
-
-    ;;
-
-
 alpine)
-
     PKG="apk"
-
     ;;
-
-
 *)
-
     echo
     echo "暂不支持系统:"
     echo "$PRETTY_NAME"
-
     exit 1
-
     ;;
-
-
 esac
-
-
 }
-
 
 
 #############################################
@@ -146,107 +104,110 @@ esac
 #############################################
 
 detect_arch(){
-
-
 echo
-
 echo "检测CPU架构..."
-
-
 ARCH=$(uname -m)
 
-
-
 case $ARCH in
-
-
 x86_64)
-
     ARCH_NAME="amd64"
-
     ;;
-
-
 aarch64)
-
     ARCH_NAME="arm64"
-
     ;;
-
-
 *)
-
     echo
     echo "暂不支持架构:"
     echo "$ARCH"
-
     exit 1
-
     ;;
-
 esac
 
-
 echo -e "架构: ${GREEN}$ARCH_NAME${RESET}"
-
-
 }
 
 
+#############################################
+# 内存检查 + swap（新增：防 OOM）
+#############################################
+
+ensure_swap(){
+echo
+echo "[0/6] 检查内存和 swap"
+
+# 兼容 busybox 的 free（alpine 无 -m 输出 Mem:/Swap: 行）
+MEM_TOTAL=$(free -m 2>/dev/null | awk '/^Mem:/ {print $2}')
+SWAP_TOTAL=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}')
+[ -z "$MEM_TOTAL" ] && MEM_TOTAL=$(free 2>/dev/null | awk '/^Mem:/ {printf "%.0f", $2/1024}')
+[ -z "$SWAP_TOTAL" ] && SWAP_TOTAL=$(free 2>/dev/null | awk '/^Swap:/ {printf "%.0f", $2/1024}')
+[ -z "$MEM_TOTAL" ] && MEM_TOTAL=512
+
+echo -e "内存: ${YELLOW}${MEM_TOTAL}MB${RESET}，Swap: ${YELLOW}${SWAP_TOTAL}MB${RESET}"
+
+# 小内存（<256MB）且 swap 不足（<128MB）→ 自动创建 swap 防 OOM
+if [ "$MEM_TOTAL" -lt 256 ] && [ "$SWAP_TOTAL" -lt 128 ]; then
+    echo -e "${YELLOW}⚠️ 检测到小内存机器，自动创建 swap 防止安装过程 OOM...${RESET}"
+
+    FREE_DISK=$(df -m / 2>/dev/null | awk 'NR==2 {print $4}')
+    [ -z "$FREE_DISK" ] && FREE_DISK=1024
+
+    SWAP_SIZE=256
+    [ "$FREE_DISK" -lt 512 ] && SWAP_SIZE=128
+
+    echo "创建 ${SWAP_SIZE}MB swap 文件..."
+    fallocate -l ${SWAP_SIZE}M /swapfile 2>/dev/null || \
+        dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE 2>/dev/null
+
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1
+    swapon /swapfile >/dev/null 2>&1
+
+    grep -q "swapfile" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+
+    echo -e "${GREEN}✅ swap ${SWAP_SIZE}MB 创建完成${RESET}"
+else
+    echo -e "${GREEN}内存/swap 充足，跳过${RESET}"
+fi
+}
+
 
 #############################################
-# 安装依赖
+# 喘息机制（防低性能机器 OOM）
+# 重操作之间：刷磁盘 + 释放 page cache + 停顿，避免内存峰值叠加
+#############################################
+
+breathe(){
+echo
+echo -e "${YELLOW}释放内存缓存，防止低配机器 OOM...${RESET}"
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sleep 1
+}
+
+
+#############################################
+# 安装依赖（精简：去掉 wget/jq，--no-install-recommends）
 #############################################
 
 install_dependencies(){
-
-
 echo
-
-echo "[1/1] 安装基础依赖"
-
+echo "[1/6] 安装基础依赖"
 
 case $PKG in
-
-
 apt)
-
-apt update
-
-apt install -y \
-curl \
-wget \
-unzip \
-jq
-
-
-;;
-
-
+    apt update
+    apt install -y --no-install-recommends curl unzip
+    apt clean
+    ;;
 apk)
-
-apk update
-
-apk add \
-curl \
-wget \
-unzip \
-jq
-
-
-;;
-
-
+    apk update
+    apk add curl unzip
+    ;;
 esac
 
-
 echo
-
 echo -e "${GREEN}依赖安装完成${RESET}"
-
-
 }
-
 
 
 #############################################
@@ -254,115 +215,61 @@ echo -e "${GREEN}依赖安装完成${RESET}"
 #############################################
 
 prepare_directory(){
-
-
 echo
-
 echo "创建工作目录"
-
-
 mkdir -p "$BASE_DIR"
-
-
 chmod 700 "$BASE_DIR"
-
-
 }
 
 
 #############################################
-# 安装 Xray
+# 安装 Xray（精简：只解压二进制，跳过 geoip/geosite 省 29MB）
 #############################################
 
 install_xray(){
-
-
 echo
-echo "[2/5] 安装 Xray"
+echo "[2/6] 安装 Xray"
 
-
-if command -v xray >/dev/null 2>&1
-then
-
-echo "检测到 Xray 已安装"
-
-xray version | head -n 1
-
-return
-
+if command -v xray >/dev/null 2>&1; then
+    echo "检测到 Xray 已安装"
+    xray version | head -n 1
+    return
 fi
-
-
 
 TMP=/tmp/xray.zip
 
-
 case $ARCH_NAME in
-
-
 amd64)
-
-URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-
-;;
-
-
+    URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+    ;;
 arm64)
-
-URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
-
-;;
-
+    URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
+    ;;
 esac
 
-
-
 echo
-
 echo "下载 Xray..."
+curl -fL --retry 5 --connect-timeout 15 "$URL" -o "$TMP"
 
-curl -fL --retry 5 "$URL" -o "$TMP"
+mkdir -p /tmp/xray_extract
 
-
-
-mkdir -p /tmp/xray
-
-
-unzip -o "$TMP" -d /tmp/xray >/dev/null || {
-
-echo "Xray解压失败"
-
-exit 1
-
+# 只解压 xray 二进制（geoip.dat/geosite.dat 对 vless+ws 无用，跳过省磁盘+内存）
+unzip -j -o "$TMP" xray -d /tmp/xray_extract >/dev/null || {
+    echo "Xray 解压失败"
+    rm -rf /tmp/xray_extract "$TMP"
+    exit 1
 }
 
-
-
-mv /tmp/xray/xray /usr/local/bin/xray
-
-
+mv /tmp/xray_extract/xray /usr/local/bin/xray
 chmod +x /usr/local/bin/xray
 
-
-
-rm -rf /tmp/xray "$TMP"
-
-
+rm -rf /tmp/xray_extract "$TMP"
 
 echo
-
-echo "Xray版本:"
-
-
+echo "Xray 版本:"
 xray version | head -n 1
-
-
-
 echo
-
-echo -e "${GREEN}Xray安装完成${RESET}"
-
-
+echo -e "${GREEN}Xray 安装完成${RESET}"
 }
 
 
@@ -370,40 +277,21 @@ echo -e "${GREEN}Xray安装完成${RESET}"
 # 生成 Xray 配置
 #############################################
 
-
 generate_xray_config(){
-
 echo
-
-echo "[3/5] 生成 Xray 配置"
-
+echo "[3/6] 生成 Xray 配置"
 
 if [ -f "$BASE_DIR/info" ]; then
-
     echo "检测到已有配置"
-
     source "$BASE_DIR/info"
-
-
-    if [ -z "$UUID" ] || [ -z "$PORT" ] || [ -z "$WS_PATH" ]
-    then
-
+    if [ -z "$UUID" ] || [ -z "$PORT" ] || [ -z "$WS_PATH" ]; then
         echo "错误: 配置文件损坏"
-
         exit 1
-
     fi
-
-
 else
-
-
     UUID=$(xray uuid)
-
     PORT=$((20000 + RANDOM % 40000))
-
     WS_PATH=$(cat /proc/sys/kernel/random/uuid | cut -d "-" -f1)
-
 
 cat > "$BASE_DIR/info" <<EOF
 UUID=$UUID
@@ -411,25 +299,19 @@ PORT=$PORT
 WS_PATH=$WS_PATH
 EOF
 
-
 chmod 600 "$BASE_DIR/info"
-
-
 fi
-
 
 cat > "$BASE_DIR/config.json" <<EOF
 {
  "log":{
    "loglevel":"warning"
  },
-
  "inbounds":[
   {
    "listen":"127.0.0.1",
    "port":$PORT,
    "protocol":"vless",
-
    "settings":{
     "clients":[
      {
@@ -438,7 +320,6 @@ cat > "$BASE_DIR/config.json" <<EOF
     ],
     "decryption":"none"
    },
-
    "streamSettings":{
     "network":"ws",
     "wsSettings":{
@@ -447,7 +328,6 @@ cat > "$BASE_DIR/config.json" <<EOF
    }
   }
  ],
-
  "outbounds":[
   {
    "protocol":"freedom"
@@ -456,107 +336,61 @@ cat > "$BASE_DIR/config.json" <<EOF
 }
 EOF
 
-
 chmod 600 "$BASE_DIR/config.json"
 
-
 echo
-
-echo "UUID:"
-echo "$UUID"
-
+echo "UUID: $UUID"
+echo "端口: $PORT"
+echo "路径: /$WS_PATH"
 echo
-
-echo "端口:"
-echo "$PORT"
-
-echo
-
-echo "路径:"
-echo "/$WS_PATH"
-
-echo
-
 echo "检查 Xray 配置"
 
-
-if ! xray run -test -config "$BASE_DIR/config.json"
-then
-
-echo "Xray 配置错误"
-
-exit 1
-
+if ! xray run -test -config "$BASE_DIR/config.json"; then
+    echo "Xray 配置错误"
+    exit 1
 fi
 
 echo -e "${GREEN}配置生成完成${RESET}"
-
-
 }
 
 
 #############################################
-# 创建 systemd 服务
+# 创建 systemd 服务（加内存限制）
 #############################################
 
-
 create_service(){
-
 echo
+echo "[4/6] 创建系统服务"
 
-echo "[4/5] 创建系统服务"
-
-
-if [ -f /etc/systemd/system/easynode-xray.service ]
-then
-
+if [ -f /etc/systemd/system/easynode-xray.service ]; then
     echo "检测到 Xray 服务已存在"
-
 else
-
-
 cat >/etc/systemd/system/easynode-xray.service <<EOF
-
 [Unit]
 Description=EasyNode Xray Service
 After=network.target
 
-
 [Service]
-
 Type=simple
-
 WorkingDirectory=/etc/easynode
-
 ExecStart=/usr/local/bin/xray run -config /etc/easynode/config.json
-
 Restart=always
-
 RestartSec=5
-
+MemoryMax=50M
+TimeoutStartSec=30
 
 [Install]
-
 WantedBy=multi-user.target
-
 EOF
 
-
 systemctl daemon-reload
-
 systemctl enable easynode-xray.service
-
-
 fi
-
 
 systemctl restart easynode-xray.service
 
-
 echo
-
 echo -e "${GREEN}服务启动完成${RESET}"
-
 }
 
 
@@ -565,131 +399,75 @@ echo -e "${GREEN}服务启动完成${RESET}"
 #############################################
 
 install_cloudflared(){
-
 echo
-echo "[5/5] 安装 Cloudflare Tunnel"
+echo "[5/6] 安装 Cloudflare Tunnel"
 
-
-if command -v cloudflared >/dev/null 2>&1
-then
-
-echo "检测到 cloudflared 已安装"
-
-cloudflared --version
-
-return
-
+if command -v cloudflared >/dev/null 2>&1; then
+    echo "检测到 cloudflared 已安装"
+    cloudflared --version
+    return
 fi
 
-
 case $ARCH_NAME in
-
-
 amd64)
-
-URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-
-;;
-
-
+    URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    ;;
 arm64)
-
-URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-
-;;
-
+    URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+    ;;
 esac
 
-
-
 echo "下载 cloudflared..."
-
-curl -fL --retry 5 "$URL" -o "/usr/local/bin/cloudflared"
-
-
+curl -fL --retry 5 --connect-timeout 15 "$URL" -o "/usr/local/bin/cloudflared"
 
 chmod +x /usr/local/bin/cloudflared
 
-
-
 echo
-
 cloudflared --version
-
-
 echo
-
-echo -e "${GREEN}cloudflared安装完成${RESET}"
-
-
+echo -e "${GREEN}cloudflared 安装完成${RESET}"
 }
 
 
 #############################################
-# 创建 Cloudflare Tunnel 服务
+# 创建 Cloudflare Tunnel 服务（加内存限制）
 #############################################
 
-
 create_cloudflared_service(){
-
 echo
-
 echo "创建 Cloudflare Tunnel 服务"
-
 
 source "$BASE_DIR/info"
 
-
-if [ -f /etc/systemd/system/easynode-cloudflared.service ]
-then
-
+if [ -f /etc/systemd/system/easynode-cloudflared.service ]; then
     echo "检测到 Cloudflare Tunnel 服务已存在"
-
 else
-
-
 cat >/etc/systemd/system/easynode-cloudflared.service <<EOF
-
 [Unit]
 Description=EasyNode Cloudflare Tunnel
 After=network.target
 
-
 [Service]
-
 Type=simple
-
 Environment=HOME=/root
-
 ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:$PORT --no-autoupdate
-
 Restart=always
-
 RestartSec=5
-
+MemoryMax=60M
+TimeoutStartSec=90
 
 [Install]
-
 WantedBy=multi-user.target
-
 EOF
 
-
 systemctl daemon-reload
-
 systemctl enable easynode-cloudflared.service
-
-
 fi
-
 
 systemctl restart easynode-cloudflared.service
 
-
 echo
-
 echo -e "${GREEN}Cloudflare Tunnel 服务完成${RESET}"
-
 }
 
 
@@ -697,21 +475,14 @@ echo -e "${GREEN}Cloudflare Tunnel 服务完成${RESET}"
 # 获取 Tunnel 地址
 #############################################
 
-
 get_tunnel_domain(){
-
 echo
-
 echo "获取 Cloudflare Tunnel 地址"
-
 
 unset DOMAIN
 
-
 for i in {1..12}
 do
-
-
 DOMAIN=$(journalctl \
 -u easynode-cloudflared \
 --since "5 minutes ago" \
@@ -720,44 +491,23 @@ DOMAIN=$(journalctl \
 | grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" \
 | tail -n1)
 
-
-if [ -n "$DOMAIN" ]
-then
-
+if [ -n "$DOMAIN" ]; then
     break
-
 fi
-
 
 echo "等待 Tunnel 创建... ${i}/12"
-
 sleep 5
-
-
 done
 
-
-
-if [ -z "$DOMAIN" ]
-then
-
+if [ -z "$DOMAIN" ]; then
     echo "获取 Tunnel 地址失败"
-
     exit 1
-
 fi
-
-
 
 DOMAIN=${DOMAIN#https://}
 
-
 echo
-
-echo "Tunnel 地址:"
-echo "$DOMAIN"
-
-
+echo "Tunnel 地址: $DOMAIN"
 }
 
 
@@ -766,35 +516,22 @@ echo "$DOMAIN"
 #############################################
 
 generate_node(){
-
 echo
-
 echo "生成节点"
-
 
 source "$BASE_DIR/info"
 
-
 NODE="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=%2F$WS_PATH"
 
-
 echo "$NODE" > "$BASE_DIR/node.txt"
-
 chmod 600 "$BASE_DIR/node.txt"
 
-
 echo
-
 echo "=============================="
-
 echo "EasyNode 部署完成"
-
 echo
-
 echo "$NODE"
-
 echo "=============================="
-
 }
 
 
@@ -802,72 +539,37 @@ echo "=============================="
 # 主流程
 #############################################
 
-
 main(){
-
-
 show_logo
-
-
 check_root
-
-
 detect_os
-
-
 detect_arch
-
-
+ensure_swap
 install_dependencies
-
-
+breathe
 prepare_directory
-
-
 install_xray
-
-
+breathe
 generate_xray_config
-
-
 create_service
-
-
 install_cloudflared
-
-
+breathe
 create_cloudflared_service
-
-
 get_tunnel_domain
-
-
 generate_node
 
-
 echo
-
-
 echo "===================================="
-
-echo -e "${GREEN}"
-echo "EasyNode 部署完成"
-echo -e "${RESET}"
-
+echo -e "${GREEN}EasyNode 部署完成${RESET}"
+echo
 echo "服务状态:"
 echo "- Xray: systemctl status easynode-xray"
 echo "- Tunnel: systemctl status easynode-cloudflared"
-
 echo
-
 echo "节点保存:"
 echo "/etc/easynode/node.txt"
-
 echo "===================================="
-
-
 }
-
 
 
 main
