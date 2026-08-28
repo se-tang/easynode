@@ -86,6 +86,18 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 ---
 
+## 关于延迟和速度
+
+如实说明：**这个节点的延迟和速度并不快**。
+
+流量走 Cloudflare 中转，国内直连时 Cloudflare 默认分配的节点 IP 往往不是最优线路，延迟偏高、速度上不去。
+
+**改善方式：配合 Cloudflare 优选 IP 使用**——用测速工具（如 CloudflareSpeedTest）选出你本地延迟最低的 CF 节点 IP，替换到节点配置的 host 里。配合优选 IP 后延迟会有明显改善，但速度上限仍受限于小鸡到 Cloudflare 的线路质量。
+
+> 定位：备用节点、轻量使用，别把它当主力大流量线路。
+
+---
+
 ## NAT 小内存优化（v1.1）
 
 针对 1C / 128MB / 1GB 的机器，做了针对性优化，解决"跑一半断开 / 自动停止"（OOM 被杀）的问题：
@@ -122,8 +134,8 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 **Q：Quick Tunnel 域名能固定吗？**
 不能。`trycloudflare.com` 是临时隧道，重启后域名会变。要固定域名需要配置 Cloudflare 命名的 Tunnel（需要自己的域名），后续版本可考虑支持。
 
-**Q：节点速度怎么样？**
-速度取决于你的小鸡到 Cloudflare 的线路质量，走 Cloudflare 网络中转，国内直连速度一般，适合作为备用节点或轻量使用。
+**Q：节点速度/延迟怎么样？**
+如实说：不快。流量走 Cloudflare 中转，国内直连延迟偏高，需配合 Cloudflare 优选 IP 使用才能改善（详见上面「关于延迟和速度」）。
 
 **Q：需要开放端口吗？**
 不需要。隧道由小鸡主动出站建立，NAT 机器无需任何入站端口。
