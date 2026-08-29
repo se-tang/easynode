@@ -128,6 +128,22 @@ echo -e "架构: ${GREEN}$ARCH_NAME${RESET}"
 
 
 #############################################
+# 服务管理检测（systemd vs OpenRC）
+#############################################
+
+detect_init(){
+    if command -v systemctl >/dev/null 2>&1; then
+        INIT="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT="openrc"
+    else
+        INIT="none"
+    fi
+    echo -e "服务管理: ${GREEN}${INIT}${RESET}"
+}
+
+
+#############################################
 # 内存检查 + swap（新增：防 OOM）
 #############################################
 
@@ -154,17 +170,21 @@ if [ "$MEM_TOTAL" -lt 256 ] && [ "$SWAP_TOTAL" -lt 128 ]; then
     SWAP_SIZE=256
     [ "$FREE_DISK" -lt 512 ] && SWAP_SIZE=128
 
-    echo "创建 ${SWAP_SIZE}MB swap 文件..."
-    fallocate -l ${SWAP_SIZE}M /swapfile 2>/dev/null || \
-        dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE 2>/dev/null
+    echo "创建 ${SWAP_SIZE}MB swap 文件（dd 写实数据）..."
+    # 用 dd 写实数据，不用 fallocate（fallocate 的稀疏文件会被 swapon 拒绝："it appears to have holes"）
+    dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE 2>/dev/null
 
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null 2>&1
-    swapon /swapfile >/dev/null 2>&1
 
-    grep -q "swapfile" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-
-    echo -e "${GREEN}✅ swap ${SWAP_SIZE}MB 创建完成${RESET}"
+    # 检测 swapon 是否真的成功（ZFS/容器环境可能拒绝 swap 文件）
+    if swapon /swapfile >/dev/null 2>&1; then
+        grep -q "swapfile" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+        echo -e "${GREEN}✅ swap ${SWAP_SIZE}MB 启用成功${RESET}"
+    else
+        rm -f /swapfile
+        echo -e "${YELLOW}⚠️ 此环境不支持 swap 文件（ZFS/容器限制），跳过 swap，改用精简安装避免 OOM${RESET}"
+    fi
 else
     echo -e "${GREEN}内存/swap 充足，跳过${RESET}"
 fi
@@ -180,7 +200,7 @@ breathe(){
 echo
 echo -e "${YELLOW}释放内存缓存，防止低配机器 OOM...${RESET}"
 sync
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+{ echo 3 > /proc/sys/vm/drop_caches; } 2>/dev/null || true
 sleep 1
 }
 
@@ -362,9 +382,32 @@ create_service(){
 echo
 echo "[4/6] 创建系统服务"
 
-if [ -f /etc/systemd/system/easynode-xray.service ]; then
-    echo "检测到 Xray 服务已存在"
+if [ "$INIT" = "openrc" ]; then
+    # OpenRC（Alpine 等）
+    if [ -f /etc/init.d/easynode-xray ]; then
+        echo "检测到 Xray 服务已存在"
+    else
+cat >/etc/init.d/easynode-xray <<EOF
+#!/sbin/openrc-run
+name="easynode-xray"
+description="EasyNode Xray Service"
+command="/usr/local/bin/xray"
+command_args="run -config /etc/easynode/config.json"
+command_background="yes"
+pidfile="/run/easynode-xray.pid"
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/easynode-xray
+        rc-update add easynode-xray default >/dev/null 2>&1
+    fi
+    rc-service easynode-xray restart
 else
+    # systemd（Debian/Ubuntu）
+    if [ -f /etc/systemd/system/easynode-xray.service ]; then
+        echo "检测到 Xray 服务已存在"
+    else
 cat >/etc/systemd/system/easynode-xray.service <<EOF
 [Unit]
 Description=EasyNode Xray Service
@@ -383,11 +426,12 @@ TimeoutStartSec=30
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable easynode-xray.service
-fi
+        systemctl daemon-reload
+        systemctl enable easynode-xray.service
+    fi
 
-systemctl restart easynode-xray.service
+    systemctl restart easynode-xray.service
+fi
 
 echo
 echo -e "${GREEN}服务启动完成${RESET}"
@@ -439,9 +483,34 @@ echo "创建 Cloudflare Tunnel 服务"
 
 source "$BASE_DIR/info"
 
-if [ -f /etc/systemd/system/easynode-cloudflared.service ]; then
-    echo "检测到 Cloudflare Tunnel 服务已存在"
+if [ "$INIT" = "openrc" ]; then
+    # OpenRC（Alpine 等）：用 output_log 记录日志，供获取 tunnel 地址
+    if [ -f /etc/init.d/easynode-cloudflared ]; then
+        echo "检测到 Cloudflare Tunnel 服务已存在"
+    else
+cat >/etc/init.d/easynode-cloudflared <<EOF
+#!/sbin/openrc-run
+name="easynode-cloudflared"
+description="EasyNode Cloudflare Tunnel"
+command="/usr/local/bin/cloudflared"
+command_args="tunnel --url http://127.0.0.1:$PORT --no-autoupdate"
+command_background="yes"
+pidfile="/run/easynode-cloudflared.pid"
+output_log="/var/log/easynode-cloudflared.log"
+error_log="/var/log/easynode-cloudflared.log"
+depend() {
+    need net
+}
+EOF
+        chmod +x /etc/init.d/easynode-cloudflared
+        rc-update add easynode-cloudflared default >/dev/null 2>&1
+    fi
+    rc-service easynode-cloudflared restart
 else
+    # systemd（Debian/Ubuntu）
+    if [ -f /etc/systemd/system/easynode-cloudflared.service ]; then
+        echo "检测到 Cloudflare Tunnel 服务已存在"
+    else
 cat >/etc/systemd/system/easynode-cloudflared.service <<EOF
 [Unit]
 Description=EasyNode Cloudflare Tunnel
@@ -460,11 +529,12 @@ TimeoutStartSec=90
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable easynode-cloudflared.service
-fi
+        systemctl daemon-reload
+        systemctl enable easynode-cloudflared.service
+    fi
 
-systemctl restart easynode-cloudflared.service
+    systemctl restart easynode-cloudflared.service
+fi
 
 echo
 echo -e "${GREEN}Cloudflare Tunnel 服务完成${RESET}"
@@ -483,13 +553,11 @@ unset DOMAIN
 
 for i in {1..12}
 do
-DOMAIN=$(journalctl \
--u easynode-cloudflared \
---since "5 minutes ago" \
--n 20 \
---no-pager -l \
-| grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" \
-| tail -n1)
+if [ "$INIT" = "openrc" ]; then
+    DOMAIN=$(grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" /var/log/easynode-cloudflared.log 2>/dev/null | tail -n1)
+else
+    DOMAIN=$(journalctl -u easynode-cloudflared --since "5 minutes ago" -n 20 --no-pager -l 2>/dev/null | grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" | tail -n1)
+fi
 
 if [ -n "$DOMAIN" ]; then
     break
@@ -544,6 +612,7 @@ show_logo
 check_root
 detect_os
 detect_arch
+detect_init
 ensure_swap
 install_dependencies
 breathe
