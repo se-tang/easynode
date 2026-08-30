@@ -540,6 +540,8 @@ EOF
         chmod +x /etc/init.d/easynode-cloudflared
         rc-update add easynode-cloudflared default >/dev/null 2>&1
     fi
+    # 清空旧日志，避免 get_tunnel_domain 抓到上一次部署的旧隧道域名
+    > /var/log/easynode-cloudflared.log 2>/dev/null || true
     rc-service easynode-cloudflared restart
 else
     # systemd（Debian/Ubuntu）
@@ -568,6 +570,8 @@ EOF
         systemctl enable easynode-cloudflared.service
     fi
 
+    # 记录 restart 时间戳，供 get_tunnel_domain 只提取本次新隧道域名（避免抓到旧域名）
+    CF_RESTART_AT=$(date +"%Y-%m-%d %H:%M:%S")
     systemctl restart easynode-cloudflared.service
 fi
 
@@ -591,7 +595,7 @@ do
 if [ "$INIT" = "openrc" ]; then
     DOMAIN=$(grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" /var/log/easynode-cloudflared.log 2>/dev/null | tail -n1)
 else
-    DOMAIN=$(journalctl -u easynode-cloudflared --since "5 minutes ago" -n 200 --no-pager -l 2>/dev/null | grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" | tail -n1)
+    DOMAIN=$(journalctl -u easynode-cloudflared --since "${CF_RESTART_AT:-5 minutes ago}" -n 200 --no-pager -l 2>/dev/null | grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" | tail -n1)
 fi
 
 if [ -n "$DOMAIN" ]; then
