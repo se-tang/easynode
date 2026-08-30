@@ -281,9 +281,16 @@ echo
 echo "[2/6] 安装 Xray"
 
 if command -v xray >/dev/null 2>&1; then
-    echo "检测到 Xray 已安装"
-    xray version | head -n 1
-    return
+    # 确保可执行（容器里可能残留 644 无执行权限的 xray）
+    chmod +x "$(command -v xray)" 2>/dev/null || true
+    # 验证 xray 真的可用（残留的可能是下载中断的不完整二进制，会段错误）
+    if xray version >/dev/null 2>&1; then
+        echo "检测到 Xray 已安装"
+        xray version | head -n 1
+        return
+    fi
+    echo "检测到残留 Xray 二进制损坏，重新安装..."
+    rm -f "$(command -v xray)"
 fi
 
 TMP=/tmp/xray.zip
