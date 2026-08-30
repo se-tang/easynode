@@ -676,4 +676,67 @@ echo "===================================="
 }
 
 
-main
+#############################################
+# 一键卸载（删除所有痕迹）
+#############################################
+
+uninstall(){
+show_logo
+check_root
+detect_init
+
+echo
+echo -e "${YELLOW}开始卸载 EasyNode...${RESET}"
+echo
+
+# 1. 停止并删除服务
+if [ "$INIT" = "openrc" ]; then
+    rc-service easynode-xray stop >/dev/null 2>&1 || true
+    rc-service easynode-cloudflared stop >/dev/null 2>&1 || true
+    rc-update del easynode-xray default >/dev/null 2>&1 || true
+    rc-update del easynode-cloudflared default >/dev/null 2>&1 || true
+    rm -f /etc/init.d/easynode-xray /etc/init.d/easynode-cloudflared
+else
+    systemctl stop easynode-xray.service easynode-cloudflared.service >/dev/null 2>&1 || true
+    systemctl disable easynode-xray.service easynode-cloudflared.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/easynode-xray.service /etc/systemd/system/easynode-cloudflared.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# 2. 杀掉残留进程
+pkill -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
+pkill -f "/usr/local/bin/cloudflared" >/dev/null 2>&1 || true
+
+# 3. 删除二进制
+rm -f /usr/local/bin/xray /usr/local/bin/cloudflared
+
+# 4. 删除配置目录
+rm -rf /etc/easynode
+
+# 5. 删除 swap（如有）
+if [ -f /swapfile ]; then
+    swapoff /swapfile >/dev/null 2>&1 || true
+    rm -f /swapfile
+    sed -i '/swapfile/d' /etc/fstab 2>/dev/null || true
+fi
+
+echo
+echo -e "${GREEN}EasyNode 已卸载，所有痕迹已清理${RESET}"
+echo
+echo "已清理："
+echo "  - 系统服务（easynode-xray / easynode-cloudflared）"
+echo "  - 二进制（/usr/local/bin/xray / cloudflared）"
+echo "  - 配置目录（/etc/easynode）"
+echo "  - swap 文件（/swapfile，如有）"
+echo
+}
+
+
+case "${1:-}" in
+    uninstall|remove|delete)
+        uninstall
+        ;;
+    *)
+        main
+        ;;
+esac

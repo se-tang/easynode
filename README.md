@@ -84,6 +84,21 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 想换一个新的节点链接，直接重跑脚本，会生成新的隧道地址并更新 `node.txt`。
 
+### 卸载（一键删除所有痕迹）
+
+不想用了，一条命令删除所有安装痕迹：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh | bash -s -- uninstall
+```
+
+会清理：
+
+- 系统服务（easynode-xray / easynode-cloudflared）
+- 二进制（/usr/local/bin/xray、/usr/local/bin/cloudflared）
+- 配置目录（/etc/easynode，含节点信息）
+- swap 文件（/swapfile，如有）
+
 ---
 
 ## 关于延迟和速度
