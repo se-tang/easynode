@@ -37,7 +37,7 @@ trap '' HUP
 #############################################
 
 show_logo(){
-clear
+clear 2>/dev/null || true
 echo "
 ====================================
         EasyNode v${VERSION}
@@ -160,30 +160,50 @@ SWAP_TOTAL=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}')
 
 echo -e "内存: ${YELLOW}${MEM_TOTAL}MB${RESET}，Swap: ${YELLOW}${SWAP_TOTAL}MB${RESET}"
 
-# 小内存（<256MB）且 swap 不足（<128MB）→ 自动创建 swap 防 OOM
+# 小内存（<256MB）且 swap 不足（<128MB）→ 尝试创建 swap 防 OOM
 if [ "$MEM_TOTAL" -lt 256 ] && [ "$SWAP_TOTAL" -lt 128 ]; then
-    echo -e "${YELLOW}⚠️ 检测到小内存机器，自动创建 swap 防止安装过程 OOM...${RESET}"
+    echo -e "${YELLOW}⚠️ 检测到小内存机器，尝试创建 swap...${RESET}"
+
+    # 先探测 swapon 是否可用（容器常禁 swapon：Operation not permitted）
+    # 用 1MB 小文件测试，避免先写大文件再失败、还触发 OOM
+    dd if=/dev/zero of=/tmp/.swaptest bs=1M count=1 oflag=direct 2>/dev/null
+    chmod 600 /tmp/.swaptest 2>/dev/null
+    mkswap /tmp/.swaptest >/dev/null 2>&1
+    if swapon /tmp/.swaptest >/dev/null 2>&1; then
+        swapoff /tmp/.swaptest >/dev/null 2>&1
+        rm -f /tmp/.swaptest
+    else
+        rm -f /tmp/.swaptest
+        echo -e "${YELLOW}⚠️ 此环境禁止 swapon（容器限制），跳过 swap，改用精简安装避免 OOM${RESET}"
+        return
+    fi
 
     FREE_DISK=$(df -m / 2>/dev/null | awk 'NR==2 {print $4}')
     [ -z "$FREE_DISK" ] && FREE_DISK=1024
 
-    SWAP_SIZE=256
-    [ "$FREE_DISK" -lt 512 ] && SWAP_SIZE=128
+    # 按内存动态定 swap 大小：64MB 小内存不用 256MB，避免 dd 写盘过大
+    if [ "$MEM_TOTAL" -lt 96 ]; then
+        SWAP_SIZE=128
+    elif [ "$FREE_DISK" -lt 512 ]; then
+        SWAP_SIZE=128
+    else
+        SWAP_SIZE=256
+    fi
 
-    echo "创建 ${SWAP_SIZE}MB swap 文件（dd 写实数据）..."
-    # 用 dd 写实数据，不用 fallocate（fallocate 的稀疏文件会被 swapon 拒绝："it appears to have holes"）
-    dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE 2>/dev/null
+    # dd 用 oflag=direct 绕过 page cache（64MB 小内存下普通 dd 会撑爆缓存导致 OOM 断 SSH）
+    echo "创建 ${SWAP_SIZE}MB swap 文件..."
+    dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE oflag=direct 2>/dev/null || \
+        dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE conv=fdatasync 2>/dev/null
 
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null 2>&1
 
-    # 检测 swapon 是否真的成功（ZFS/容器环境可能拒绝 swap 文件）
     if swapon /swapfile >/dev/null 2>&1; then
         grep -q "swapfile" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
         echo -e "${GREEN}✅ swap ${SWAP_SIZE}MB 启用成功${RESET}"
     else
         rm -f /swapfile
-        echo -e "${YELLOW}⚠️ 此环境不支持 swap 文件（ZFS/容器限制），跳过 swap，改用精简安装避免 OOM${RESET}"
+        echo -e "${YELLOW}⚠️ swap 文件无法启用，跳过，改用精简安装避免 OOM${RESET}"
     fi
 else
     echo -e "${GREEN}内存/swap 充足，跳过${RESET}"
@@ -213,15 +233,25 @@ install_dependencies(){
 echo
 echo "[1/6] 安装基础依赖"
 
+# 先检查 curl/unzip 是否已装（小内存镜像常预装，跳过 apt/apk 避免 64MB 内存 OOM）
+NEED=""
+command -v curl >/dev/null 2>&1 || NEED="$NEED curl"
+command -v unzip >/dev/null 2>&1 || NEED="$NEED unzip"
+
+if [ -z "$NEED" ]; then
+    echo "curl/unzip 已安装，跳过"
+    return
+fi
+
 case $PKG in
 apt)
     apt update
-    apt install -y --no-install-recommends curl unzip
+    apt install -y --no-install-recommends $NEED
     apt clean
     ;;
 apk)
     apk update
-    apk add curl unzip
+    apk add $NEED
     ;;
 esac
 
@@ -271,19 +301,17 @@ echo
 echo "下载 Xray..."
 curl -fL --retry 5 --connect-timeout 15 "$URL" -o "$TMP"
 
-mkdir -p /tmp/xray_extract
-
-# 只解压 xray 二进制（geoip.dat/geosite.dat 对 vless+ws 无用，跳过省磁盘+内存）
-unzip -j -o "$TMP" xray -d /tmp/xray_extract >/dev/null || {
+# 流式解压 + direct IO 写盘（绕过 page cache，64MB 小内存下 unzip 直接写盘会 OOM 断 SSH）
+# unzip -p 解压到 stdout，dd oflag=direct 直接写盘，不占 page cache
+unzip -p "$TMP" xray 2>/dev/null | dd of=/usr/local/bin/xray bs=1M oflag=direct 2>/dev/null || {
     echo "Xray 解压失败"
-    rm -rf /tmp/xray_extract "$TMP"
+    rm -f "$TMP" /usr/local/bin/xray
     exit 1
 }
 
-mv /tmp/xray_extract/xray /usr/local/bin/xray
 chmod +x /usr/local/bin/xray
 
-rm -rf /tmp/xray_extract "$TMP"
+rm -f "$TMP"
 
 echo
 echo "Xray 版本:"
@@ -556,7 +584,7 @@ do
 if [ "$INIT" = "openrc" ]; then
     DOMAIN=$(grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" /var/log/easynode-cloudflared.log 2>/dev/null | tail -n1)
 else
-    DOMAIN=$(journalctl -u easynode-cloudflared --since "5 minutes ago" -n 20 --no-pager -l 2>/dev/null | grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" | tail -n1)
+    DOMAIN=$(journalctl -u easynode-cloudflared --since "5 minutes ago" -n 200 --no-pager -l 2>/dev/null | grep -oE "https://[-a-zA-Z0-9]+\.trycloudflare\.com" | tail -n1)
 fi
 
 if [ -n "$DOMAIN" ]; then
