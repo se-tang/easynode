@@ -418,10 +418,7 @@ echo
 echo "[4/6] 创建系统服务"
 
 if [ "$INIT" = "openrc" ]; then
-    # OpenRC（Alpine 等）
-    if [ -f /etc/init.d/easynode-xray ]; then
-        echo "检测到 Xray 服务已存在"
-    else
+    # OpenRC（Alpine 等）——总是重写
 cat >/etc/init.d/easynode-xray <<EOF
 #!/sbin/openrc-run
 name="easynode-xray"
@@ -434,15 +431,11 @@ depend() {
     need net
 }
 EOF
-        chmod +x /etc/init.d/easynode-xray
-        rc-update add easynode-xray default >/dev/null 2>&1
-    fi
+    chmod +x /etc/init.d/easynode-xray
+    rc-update add easynode-xray default >/dev/null 2>&1
     rc-service easynode-xray restart
 else
-    # systemd（Debian/Ubuntu）
-    if [ -f /etc/systemd/system/easynode-xray.service ]; then
-        echo "检测到 Xray 服务已存在"
-    else
+    # systemd（Debian/Ubuntu）——总是重写，确保新版本内存限制等配置生效
 cat >/etc/systemd/system/easynode-xray.service <<EOF
 [Unit]
 Description=EasyNode Xray Service
@@ -463,9 +456,8 @@ TimeoutStartSec=30
 WantedBy=multi-user.target
 EOF
 
-        systemctl daemon-reload
-        systemctl enable easynode-xray.service
-    fi
+    systemctl daemon-reload
+    systemctl enable easynode-xray.service 2>/dev/null
 
     systemctl restart easynode-xray.service
 fi
@@ -521,10 +513,7 @@ echo "创建 Cloudflare Tunnel 服务"
 source "$BASE_DIR/info"
 
 if [ "$INIT" = "openrc" ]; then
-    # OpenRC（Alpine 等）：用 output_log 记录日志，供获取 tunnel 地址
-    if [ -f /etc/init.d/easynode-cloudflared ]; then
-        echo "检测到 Cloudflare Tunnel 服务已存在"
-    else
+    # OpenRC（Alpine 等）：用 output_log 记录日志，供获取 tunnel 地址——总是重写
 cat >/etc/init.d/easynode-cloudflared <<EOF
 #!/sbin/openrc-run
 name="easynode-cloudflared"
@@ -539,17 +528,13 @@ depend() {
     need net
 }
 EOF
-        chmod +x /etc/init.d/easynode-cloudflared
-        rc-update add easynode-cloudflared default >/dev/null 2>&1
-    fi
+    chmod +x /etc/init.d/easynode-cloudflared
+    rc-update add easynode-cloudflared default >/dev/null 2>&1
     # 清空旧日志，避免 get_tunnel_domain 抓到上一次部署的旧隧道域名
     > /var/log/easynode-cloudflared.log 2>/dev/null || true
     rc-service easynode-cloudflared restart
 else
-    # systemd（Debian/Ubuntu）
-    if [ -f /etc/systemd/system/easynode-cloudflared.service ]; then
-        echo "检测到 Cloudflare Tunnel 服务已存在"
-    else
+    # systemd（Debian/Ubuntu）——总是重写
 cat >/etc/systemd/system/easynode-cloudflared.service <<EOF
 [Unit]
 Description=EasyNode Cloudflare Tunnel
@@ -570,9 +555,8 @@ TimeoutStartSec=90
 WantedBy=multi-user.target
 EOF
 
-        systemctl daemon-reload
-        systemctl enable easynode-cloudflared.service
-    fi
+    systemctl daemon-reload
+    systemctl enable easynode-cloudflared.service 2>/dev/null
 
     # 记录 restart 时间戳，供 get_tunnel_domain 只提取本次新隧道域名（避免抓到旧域名）
     CF_RESTART_AT=$(date +"%Y-%m-%d %H:%M:%S")
