@@ -160,8 +160,8 @@ SWAP_TOTAL=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}')
 
 echo -e "内存: ${YELLOW}${MEM_TOTAL}MB${RESET}，Swap: ${YELLOW}${SWAP_TOTAL}MB${RESET}"
 
-# 小内存（<256MB）且 swap 不足（<128MB）→ 尝试创建 swap 防 OOM
-if [ "$MEM_TOTAL" -lt 256 ] && [ "$SWAP_TOTAL" -lt 128 ]; then
+# 小内存（<=512MB）且 swap 不足（<256MB）→ 尝试创建 swap 防 OOM
+if [ "$MEM_TOTAL" -le 512 ] && [ "$SWAP_TOTAL" -lt 256 ]; then
     echo -e "${YELLOW}⚠️ 检测到小内存机器，尝试创建 swap...${RESET}"
 
     # 先探测 swapon 是否可用（容器常禁 swapon：Operation not permitted）
@@ -181,13 +181,13 @@ if [ "$MEM_TOTAL" -lt 256 ] && [ "$SWAP_TOTAL" -lt 128 ]; then
     FREE_DISK=$(df -m / 2>/dev/null | awk 'NR==2 {print $4}')
     [ -z "$FREE_DISK" ] && FREE_DISK=1024
 
-    # 按内存动态定 swap 大小：64MB 小内存不用 256MB，避免 dd 写盘过大
+    # 按内存动态定 swap 大小：小内存用大 swap 兜底（测速/突发流量会瞬间拉高内存）
     if [ "$MEM_TOTAL" -lt 96 ]; then
-        SWAP_SIZE=128
-    elif [ "$FREE_DISK" -lt 512 ]; then
-        SWAP_SIZE=128
-    else
         SWAP_SIZE=256
+    elif [ "$FREE_DISK" -lt 1024 ]; then
+        SWAP_SIZE=256
+    else
+        SWAP_SIZE=512
     fi
 
     # dd 用 oflag=direct 绕过 page cache（64MB 小内存下普通 dd 会撑爆缓存导致 OOM 断 SSH）
@@ -451,9 +451,11 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/etc/easynode
+Environment=GOMEMLIMIT=35MiB
 ExecStart=/usr/local/bin/xray run -config /etc/easynode/config.json
 Restart=always
 RestartSec=5
+MemoryHigh=30M
 MemoryMax=50M
 TimeoutStartSec=30
 
@@ -556,9 +558,11 @@ After=network.target
 [Service]
 Type=simple
 Environment=HOME=/root
+Environment=GOMEMLIMIT=45MiB
 ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:$PORT --no-autoupdate
 Restart=always
 RestartSec=5
+MemoryHigh=40M
 MemoryMax=60M
 TimeoutStartSec=90
 
