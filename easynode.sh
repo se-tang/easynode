@@ -616,7 +616,7 @@ echo "生成节点"
 
 source "$BASE_DIR/info"
 
-NODE="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=%2F$WS_PATH"
+NODE="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=%2F$WS_PATH#easynode"
 
 echo "$NODE" > "$BASE_DIR/node.txt"
 chmod 600 "$BASE_DIR/node.txt"
