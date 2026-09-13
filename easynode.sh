@@ -713,12 +713,153 @@ NODE="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAI
 echo "$NODE" > "$BASE_DIR/node.txt"
 chmod 600 "$BASE_DIR/node.txt"
 
+# 侧车元数据：当前域名 + 更新时间（watchdog 检测到域名变化时也会刷新）
+printf 'domain=%s\nupdated=%s\n' "$DOMAIN" "$(date '+%Y-%m-%d %H:%M:%S')" > "$BASE_DIR/tunnel.meta"
+chmod 600 "$BASE_DIR/tunnel.meta"
+
 echo
 echo "=============================="
 echo "EasyNode 部署完成"
 echo
 echo "$NODE"
 echo "=============================="
+}
+
+
+#############################################
+# 端到端校验：确认隧道真的能用，而不只是"服务在跑"
+# 404 = 隧道通且 Xray 在应答（Xray 对非匹配路径的标准响应）
+# 502 = cloudflared 正常但 Xray 未应答；530 = 隧道未注册/连接器掉线
+#############################################
+
+verify_tunnel(){
+echo
+echo "端到端校验（期望 HTTP 404）"
+
+CODE=""
+for i in 1 2 3; do
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$DOMAIN/" 2>/dev/null)
+    [ "$CODE" = "404" ] && break
+    [ "$i" -lt 3 ] && sleep 5
+done
+
+if [ "$CODE" = "404" ]; then
+    echo -e "${GREEN}✅ 隧道校验通过${RESET}"
+    return 0
+fi
+
+echo -e "${YELLOW}⚠️ 隧道校验未通过（期望 404，实际 ${CODE:-无响应}）${RESET}"
+echo "   502=cloudflared 正常但 Xray 未应答；530=隧道未注册或连接器掉线"
+echo "   新隧道偶尔需要更长时间生效，可用 systemctl status easynode-cloudflared 排查，"
+echo "   或稍后重新运行本脚本重新部署"
+return 0
+}
+
+
+#############################################
+# 安装域名守护（watchdog）
+# Quick Tunnel 每次 cloudflared 重启/机器重启都会换域名，而 node.txt 只在部署时写一次，
+# 结果是"服务看着都正常、节点其实已失效"。watchdog 定时检测域名变化并自动重写 node.txt。
+#############################################
+
+install_watchdog(){
+echo
+echo "安装域名守护（watchdog）"
+
+# 1. 守护脚本本体（每次部署都重写，幂等）
+cat > /usr/local/bin/easynode-watchdog <<'WEOF'
+#!/bin/bash
+# EasyNode watchdog：检测 Quick Tunnel 域名变化并重写 node.txt
+# 设计为完全静默：域名没变/未部署/信息不全时零输出零写盘
+
+BASE_DIR="/etc/easynode"
+NODE_FILE="$BASE_DIR/node.txt"
+META_FILE="$BASE_DIR/tunnel.meta"
+CF_LOG="/var/log/easynode-cloudflared.log"
+
+# 未部署或已卸载 → 静默退出
+[ -f "$NODE_FILE" ] || exit 0
+
+# 取当前域名：journal / 日志里"最后一次出现"的 trycloudflare URL 即当前隧道
+# （quick tunnel 每次 start 打印一次 URL，tail -1 天然等于现值，无需时间窗；
+#   部署期 get_tunnel_domain 用的是时间窗方案，两者场景不同，正则需保持一致）
+DOMAIN=""
+if command -v journalctl >/dev/null 2>&1; then
+    DOMAIN=$(journalctl -u easynode-cloudflared -n 500 --no-pager 2>/dev/null | grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' | tail -n1)
+fi
+if [ -z "$DOMAIN" ] && [ -f "$CF_LOG" ]; then
+    DOMAIN=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | tail -n1)
+fi
+[ -n "$DOMAIN" ] || exit 0
+DOMAIN=${DOMAIN#https://}
+
+# OpenRC 日志轮转：cloudflared 日志超 5MB 截留尾部 256KB（systemd 走 journal，无此文件）
+# 注意要在域名提取之后、退出判断之前做，否则域名长期不变时日志永远轮转不到
+if [ -f "$CF_LOG" ]; then
+    LOG_SIZE=$(wc -c < "$CF_LOG" 2>/dev/null || echo 0)
+    if [ "$LOG_SIZE" -gt 5242880 ] 2>/dev/null; then
+        tail -c 262144 "$CF_LOG" > "$CF_LOG.tmp" 2>/dev/null && cat "$CF_LOG.tmp" > "$CF_LOG" && rm -f "$CF_LOG.tmp"
+    fi
+fi
+
+# 域名没变 → 静默退出
+OLD_DOMAIN=$(sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p' "$NODE_FILE" 2>/dev/null)
+[ "$OLD_DOMAIN" = "$DOMAIN" ] && exit 0
+
+# 域名变了 → 复用原有 UUID/WS_PATH 重拼节点链接（端口/UUID/路径都不变，只有域名会变）
+[ -f "$BASE_DIR/info" ] || exit 0
+. "$BASE_DIR/info"
+if [ -z "${UUID:-}" ] || [ -z "${WS_PATH:-}" ]; then
+    exit 0
+fi
+
+NODE="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=%2F$WS_PATH#easynode"
+
+# 原子替换（tmp + mv），umask 077 保证新文件仍是 600
+umask 077
+printf '%s\n' "$NODE" > "$NODE_FILE.tmp" 2>/dev/null && mv -f "$NODE_FILE.tmp" "$NODE_FILE" || exit 0
+printf 'domain=%s\nupdated=%s\n' "$DOMAIN" "$(date '+%Y-%m-%d %H:%M:%S')" > "$META_FILE.tmp" 2>/dev/null && mv -f "$META_FILE.tmp" "$META_FILE"
+
+exit 0
+WEOF
+chmod 700 /usr/local/bin/easynode-watchdog
+
+# 2. 定时执行
+if [ "$INIT" = "openrc" ]; then
+    # Alpine：busybox crond（base 自带），crontab 里只追加自己的行
+    rc-update add crond default >/dev/null 2>&1 || true
+    rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+    grep -q "easynode-watchdog" /etc/crontabs/root 2>/dev/null || \
+        echo "*/3 * * * * /usr/local/bin/easynode-watchdog" >> /etc/crontabs/root
+else
+cat >/etc/systemd/system/easynode-watchdog.service <<'EOF'
+[Unit]
+Description=EasyNode Watchdog (tunnel domain sync)
+After=easynode-cloudflared.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/easynode-watchdog
+EOF
+
+cat >/etc/systemd/system/easynode-watchdog.timer <<'EOF'
+[Unit]
+Description=Run EasyNode Watchdog periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+Unit=easynode-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now easynode-watchdog.timer >/dev/null 2>&1 || true
+fi
+
+echo -e "${GREEN}域名守护已启用（域名变化后约 3 分钟内自动更新 node.txt）${RESET}"
 }
 
 
@@ -752,6 +893,8 @@ breathe
 create_cloudflared_service
 get_tunnel_domain
 generate_node
+install_watchdog
+verify_tunnel
 
 echo
 echo "===================================="
@@ -761,8 +904,16 @@ echo "服务状态:"
 echo "- Xray: systemctl status easynode-xray"
 echo "- Tunnel: systemctl status easynode-cloudflared"
 echo
+echo "域名守护:"
+if [ "$INIT" = "openrc" ]; then
+    echo "- crond 每 3 分钟执行 /usr/local/bin/easynode-watchdog"
+else
+    echo "- systemctl list-timers easynode-watchdog.timer"
+fi
+echo
 echo "节点保存:"
 echo "/etc/easynode/node.txt"
+echo "（隧道/机器重启后域名会变，watchdog 会自动更新该文件，客户端重新导入一次即可）"
 echo "===================================="
 }
 
@@ -787,19 +938,29 @@ if [ "$INIT" = "openrc" ]; then
     rc-update del easynode-xray default >/dev/null 2>&1 || true
     rc-update del easynode-cloudflared default >/dev/null 2>&1 || true
     rm -f /etc/init.d/easynode-xray /etc/init.d/easynode-cloudflared
+    # crontab 只删 watchdog 那一行（可能有用户自己的任务）
+    sed -i '/easynode-watchdog/d' /etc/crontabs/root 2>/dev/null || true
 else
     systemctl stop easynode-xray.service easynode-cloudflared.service >/dev/null 2>&1 || true
     systemctl disable easynode-xray.service easynode-cloudflared.service >/dev/null 2>&1 || true
+    systemctl disable --now easynode-watchdog.timer >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/easynode-xray.service /etc/systemd/system/easynode-cloudflared.service
+    rm -f /etc/systemd/system/easynode-watchdog.service /etc/systemd/system/easynode-watchdog.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
+
+# 1.5 停掉可能正在执行的 watchdog，防止卸载过程中又写一次 node.txt
+pkill -f "easynode-watchdog" >/dev/null 2>&1 || true
 
 # 2. 杀掉残留进程
 pkill -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
 pkill -f "/usr/local/bin/cloudflared" >/dev/null 2>&1 || true
 
-# 3. 删除二进制
+# 3. 删除二进制与守护
 rm -f /usr/local/bin/xray /usr/local/bin/cloudflared
+rm -f /usr/local/bin/easynode-watchdog
+rm -rf /var/lib/easynode-cloudflared
+rm -f /var/log/easynode-cloudflared.log
 
 # 4. 删除配置目录
 rm -rf /etc/easynode
@@ -816,8 +977,11 @@ echo -e "${GREEN}EasyNode 已卸载，所有痕迹已清理${RESET}"
 echo
 echo "已清理："
 echo "  - 系统服务（easynode-xray / easynode-cloudflared）"
-echo "  - 二进制（/usr/local/bin/xray / cloudflared）"
+echo "  - 域名守护（watchdog 脚本 / systemd timer 或 crond 任务 / tunnel.meta）"
+echo "  - 二进制（/usr/local/bin/xray / cloudflared / easynode-watchdog）"
 echo "  - 配置目录（/etc/easynode）"
+echo "  - cloudflared 状态目录（/var/lib/easynode-cloudflared）"
+echo "  - cloudflared 日志（/var/log/easynode-cloudflared.log，如有）"
 echo "  - swap 文件（/swapfile，如有）"
 echo
 }
