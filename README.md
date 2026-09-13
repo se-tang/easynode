@@ -46,6 +46,7 @@ Xray 监听本地端口 → Cloudflare Quick Tunnel 打洞到公网 → 生成 V
 ## 特性
 
 - 🚀 **一键部署**：复制粘贴回车，全自动完成
+- 🐕 **域名自愈**：内置 watchdog，隧道换域名后自动更新节点文件（客户端重新导入一次即可）
 - 🌐 **NAT 友好**：无需公网 IP、无需开放端口，出站打洞
 - 💰 **全程免费**：Xray 开源、Cloudflare Quick Tunnel 免费
 - 🪶 **小内存可用**：针对 128MB 小鸡做了专项优化（见下文）
@@ -59,6 +60,8 @@ Xray 监听本地端口 → Cloudflare Quick Tunnel 打洞到公网 → 生成 V
 ```bash
 curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh | bash
 ```
+
+> Alpine 系统没有预装 bash，先执行 `apk add bash` 再运行上面的命令。
 
 跑完会输出一个 `vless://` 节点链接，直接导入客户端（V2rayN / v2rayNG / Shadowrocket 等）即可。
 
@@ -74,7 +77,15 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 ### VPS 重启后
 
-Cloudflare Quick Tunnel 是**临时隧道**，重启后域名会变。VPS 重启后重新跑一次脚本即可拿到新节点：
+Cloudflare Quick Tunnel 是**临时隧道**，cloudflared 每次重启（包括机器重启）域名都会变。
+
+v1.2 起内置**域名守护（watchdog）**：域名变化后约 3 分钟内自动更新服务器上的 `/etc/easynode/node.txt`，无需重跑脚本。注意客户端里的旧链接不会自己变，重新导入一次新链接即可：
+
+```bash
+cat /etc/easynode/node.txt
+```
+
+如果节点还是不通，重新跑一次部署脚本即可完全重建：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh | bash
@@ -82,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 ### 更换节点
 
-想换一个新的节点链接，直接重跑脚本，会生成新的隧道地址并更新 `node.txt`。
+想换一个新的节点链接，直接重跑脚本，会生成新的隧道地址并更新 `node.txt`（UUID/端口/路径保持不变，只换域名）。
 
 ### 卸载（一键删除所有痕迹）
 
@@ -95,8 +106,10 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 会清理：
 
 - 系统服务（easynode-xray / easynode-cloudflared）
-- 二进制（/usr/local/bin/xray、/usr/local/bin/cloudflared）
+- 域名守护（watchdog 脚本、systemd timer / crond 任务、/var/lib/easynode-cloudflared）
+- 二进制（/usr/local/bin/xray、/usr/local/bin/cloudflared、/usr/local/bin/easynode-watchdog）
 - 配置目录（/etc/easynode，含节点信息）
+- cloudflared 日志（/var/log/easynode-cloudflared.log，如有）
 - swap 文件（/swapfile，如有）
 
 ---
@@ -113,18 +126,20 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 ---
 
-## NAT 小内存优化（v1.1）
+## NAT 小内存优化（v1.2）
 
 针对 1C / 128MB / 1GB 的机器，做了针对性优化，解决"跑一半断开 / 自动停止"（OOM 被杀）的问题：
 
 | 优化 | 说明 |
 |:--|:--|
-| **自动创建 swap** | 内存 <256MB 且 swap 不足时，自动创建 256MB swap 防 OOM |
+| **自动创建 swap** | 内存 ≤512MB 且 swap 不足（<256MB）时自动创建 256~512MB swap；磁盘吃紧会自动降档或跳过 |
 | **SSH 断开保护** | 忽略挂断信号，SSH 断线不中断部署 |
 | **分步喘息** | 重操作之间刷磁盘 + 释放缓存 + 停顿，避免内存峰值叠加 |
 | **精简依赖** | 去掉无用依赖，`--no-install-recommends`，装完清理缓存 |
 | **Xray 只装二进制** | 跳过用不上的 geo 数据文件，省约 29MB 磁盘 |
 | **内存限制** | systemd 加 `MemoryMax`，防运行期 OOM 陷入重启循环 |
+| **域名守护** | watchdog 定时同步隧道域名到 `node.txt`，防止"服务正常但节点悄悄失效" |
+| **进程守护** | OpenRC 侧改用 `supervise-daemon`，与 systemd 的 `Restart=always` 对齐 |
 
 > **原理**：小内存机器"爆了"，通常是瞬时内存峰值叠加（apt 缓存 + 解压 + 下载挤在一起）触发了 OOM killer。swap 提供兜底，分步喘息让峰值不叠加，精简安装降低单步峰值。
 
@@ -134,7 +149,7 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 | 项目 | 支持 |
 |:--|:--|
-| 系统 | Debian / Ubuntu / Alpine |
+| 系统 | Debian / Ubuntu / Alpine（Alpine 需先 `apk add bash`） |
 | 架构 | amd64 / arm64 |
 | 内存 | 128MB 起（建议有 swap） |
 | 磁盘 | 1GB 起 |
@@ -144,10 +159,10 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 ## 常见问题
 
 **Q：为什么节点连不上？**
-先确认两个服务都在跑：`systemctl status easynode-xray` 和 `systemctl status easynode-cloudflared`。
+先确认两个服务都在跑：`systemctl status easynode-xray` 和 `systemctl status easynode-cloudflared`（Alpine 用 `rc-service easynode-cloudflared status`）。服务都在跑还连不上，多半是隧道换过域名——`cat /etc/easynode/node.txt` 拿最新链接重新导入。
 
 **Q：Quick Tunnel 域名能固定吗？**
-不能。`trycloudflare.com` 是临时隧道，重启后域名会变。要固定域名需要配置 Cloudflare 命名的 Tunnel（需要自己的域名），后续版本可考虑支持。
+不能。`trycloudflare.com` 是临时隧道，cloudflared 每次重启域名都会变。v1.2 的 watchdog 会在域名变化后约 3 分钟内自动更新服务器上的 `node.txt`，但客户端需要重新导入。要彻底固定域名需要配置 Cloudflare 命名的 Tunnel（需要自己的域名），后续版本可考虑支持。
 
 **Q：节点速度/延迟怎么样？**
 如实说：不快。流量走 Cloudflare 中转，国内直连延迟偏高，需配合 Cloudflare 优选 IP 使用才能改善（详见上面「关于延迟和速度」）。

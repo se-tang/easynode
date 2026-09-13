@@ -4,7 +4,7 @@
 # EasyNode
 # VPS 一键节点部署工具
 #
-# Version: 1.1 (NAT 小内存机器优化版)
+# Version: 1.2 (域名守护 + 健壮性加固版)
 #################################################
 
 set -e
@@ -15,7 +15,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exit 1
 fi
 
-VERSION="1.1"
+VERSION="1.2"
 
 
 #############################################
@@ -750,7 +750,7 @@ fi
 
 echo -e "${YELLOW}⚠️ 隧道校验未通过（期望 404，实际 ${CODE:-无响应}）${RESET}"
 echo "   502=cloudflared 正常但 Xray 未应答；530=隧道未注册或连接器掉线"
-echo "   新隧道偶尔需要更长时间生效，可用 systemctl status easynode-cloudflared 排查，"
+echo "   新隧道偶尔需要更长时间生效，可查看 easynode-cloudflared 服务状态/日志排查，"
 echo "   或稍后重新运行本脚本重新部署"
 return 0
 }
