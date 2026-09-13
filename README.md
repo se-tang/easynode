@@ -106,7 +106,7 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 会清理：
 
 - 系统服务（easynode-xray / easynode-cloudflared）
-- 域名守护（watchdog 脚本、systemd timer / crond 任务、/var/lib/easynode-cloudflared）
+- 域名守护（watchdog 脚本与常驻循环、systemd timer / OpenRC 服务、/var/lib/easynode-cloudflared）
 - 二进制（/usr/local/bin/xray、/usr/local/bin/cloudflared、/usr/local/bin/easynode-watchdog）
 - 配置目录（/etc/easynode，含节点信息）
 - cloudflared 日志（/var/log/easynode-cloudflared.log，如有）
