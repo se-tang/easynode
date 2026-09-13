@@ -482,14 +482,14 @@ echo
 echo "[4/6] 创建系统服务"
 
 if [ "$INIT" = "openrc" ]; then
-    # OpenRC（Alpine 等）——总是重写
+    # supervise-daemon 提供进程守护（等价 systemd 的 Restart=always），需 OpenRC >= 0.42
 cat >/etc/init.d/easynode-xray <<EOF
 #!/sbin/openrc-run
 name="easynode-xray"
 description="EasyNode Xray Service"
+supervisor="supervise-daemon"
 command="/usr/local/bin/xray"
 command_args="run -config /etc/easynode/config.json"
-command_background="yes"
 pidfile="/run/easynode-xray.pid"
 depend() {
     need net
@@ -515,6 +515,11 @@ RestartSec=5
 MemoryHigh=30M
 MemoryMax=50M
 TimeoutStartSec=30
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -589,14 +594,15 @@ echo "创建 Cloudflare Tunnel 服务"
 source "$BASE_DIR/info"
 
 if [ "$INIT" = "openrc" ]; then
-    # OpenRC（Alpine 等）：用 output_log 记录日志，供获取 tunnel 地址——总是重写
+    # supervise-daemon 守护进程（挂了自动拉起），output_log 供提取 tunnel 地址
+    # （sh/supervise-daemon.sh 会把 output_log/error_log 转成 --stdout/--stderr），需 OpenRC >= 0.42
 cat >/etc/init.d/easynode-cloudflared <<EOF
 #!/sbin/openrc-run
 name="easynode-cloudflared"
 description="EasyNode Cloudflare Tunnel"
+supervisor="supervise-daemon"
 command="/usr/local/bin/cloudflared"
 command_args="tunnel --url http://127.0.0.1:$PORT --no-autoupdate"
-command_background="yes"
 pidfile="/run/easynode-cloudflared.pid"
 output_log="/var/log/easynode-cloudflared.log"
 error_log="/var/log/easynode-cloudflared.log"
@@ -611,6 +617,10 @@ EOF
     rc-service easynode-cloudflared restart
 else
     # systemd（Debian/Ubuntu）——总是重写
+    # HOME 指到独立目录 + ReadWritePaths：让 ProtectSystem=strict 可用（strict 会把 /root 挂只读）
+    mkdir -p /var/lib/easynode-cloudflared
+    chmod 700 /var/lib/easynode-cloudflared
+
 cat >/etc/systemd/system/easynode-cloudflared.service <<EOF
 [Unit]
 Description=EasyNode Cloudflare Tunnel
@@ -618,7 +628,7 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=HOME=/root
+Environment=HOME=/var/lib/easynode-cloudflared
 Environment=GOMEMLIMIT=45MiB
 ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:$PORT --no-autoupdate
 Restart=always
@@ -626,6 +636,12 @@ RestartSec=5
 MemoryHigh=40M
 MemoryMax=60M
 TimeoutStartSec=90
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/easynode-cloudflared
 
 [Install]
 WantedBy=multi-user.target
