@@ -862,6 +862,9 @@ supervisor="supervise-daemon"
 command="/usr/local/bin/easynode-watchdog-loop"
 pidfile="/run/easynode-watchdog.pid"
 EOF
+    # 缺了这行 rc-service 会 Permission denied、rc-update 注册不进 runlevel
+    # （与 xray/cloudflared 两个 init 脚本保持一致）
+    chmod +x /etc/init.d/easynode-watchdog
 
     if rc-update add easynode-watchdog default >/dev/null 2>&1 && rc-service easynode-watchdog restart >/dev/null 2>&1; then
         echo -e "${GREEN}域名守护已启用（常驻循环每 3 分钟检测一次，域名变化后自动更新 node.txt）${RESET}"
