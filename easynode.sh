@@ -9,6 +9,12 @@
 
 set -e
 
+# 本脚本依赖 bash（ RANDOM / {1..12} 等）；Alpine 默认无 bash，需先 apk add bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "请用 bash 运行本脚本（Alpine: apk add bash 后再执行）"
+    exit 1
+fi
+
 VERSION="1.1"
 
 
@@ -157,6 +163,8 @@ SWAP_TOTAL=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}')
 [ -z "$MEM_TOTAL" ] && MEM_TOTAL=$(free 2>/dev/null | awk '/^Mem:/ {printf "%.0f", $2/1024}')
 [ -z "$SWAP_TOTAL" ] && SWAP_TOTAL=$(free 2>/dev/null | awk '/^Swap:/ {printf "%.0f", $2/1024}')
 [ -z "$MEM_TOTAL" ] && MEM_TOTAL=512
+# busybox 变体的 free 可能没有 Swap 行，不兜底的话下面的 -lt 比较会报 test 语法错
+[ -z "$SWAP_TOTAL" ] && SWAP_TOTAL=0
 
 echo -e "内存: ${YELLOW}${MEM_TOTAL}MB${RESET}，Swap: ${YELLOW}${SWAP_TOTAL}MB${RESET}"
 
@@ -188,6 +196,16 @@ if [ "$MEM_TOTAL" -le 512 ] && [ "$SWAP_TOTAL" -lt 256 ]; then
         SWAP_SIZE=256
     else
         SWAP_SIZE=512
+    fi
+
+    # 磁盘封顶：可用磁盘连 "swap + 200MB 余量" 都不够就降档/放弃（根分区顶满比 OOM 更难收拾）
+    if [ "$FREE_DISK" -lt $((SWAP_SIZE + 200)) ]; then
+        if [ "$SWAP_SIZE" -eq 512 ] && [ "$FREE_DISK" -ge 456 ]; then
+            SWAP_SIZE=256
+        else
+            echo -e "${YELLOW}⚠️ 可用磁盘不足（${FREE_DISK}MB 可用），跳过 swap${RESET}"
+            return
+        fi
     fi
 
     # dd 用 oflag=direct 绕过 page cache（64MB 小内存下普通 dd 会撑爆缓存导致 OOM 断 SSH）
@@ -245,13 +263,15 @@ fi
 
 case $PKG in
 apt)
+    # 非交互模式，防止个别镜像卡在 apt 确认提示
+    export DEBIAN_FRONTEND=noninteractive
     apt update
     apt install -y --no-install-recommends $NEED
     apt clean
     ;;
 apk)
-    apk update
-    apk add $NEED
+    # --no-cache 边取索引边装，不落缓存，省磁盘
+    apk add --no-cache $NEED
     ;;
 esac
 
@@ -310,21 +330,65 @@ curl -fL --retry 5 --connect-timeout 15 "$URL" -o "$TMP"
 
 # 流式解压 + direct IO 写盘（绕过 page cache，64MB 小内存下 unzip 直接写盘会 OOM 断 SSH）
 # unzip -p 解压到 stdout，dd oflag=direct 直接写盘，不占 page cache
-unzip -p "$TMP" xray 2>/dev/null | dd of=/usr/local/bin/xray bs=1M oflag=direct 2>/dev/null || {
-    echo "Xray 解压失败"
-    rm -f "$TMP" /usr/local/bin/xray
-    exit 1
-}
+# oflag=direct 在 tmpfs/FUSE/老内核 overlayfs/部分 ZFS 上会 EINVAL，失败时回退普通写
+if ! unzip -p "$TMP" xray 2>/dev/null | dd of=/usr/local/bin/xray bs=1M oflag=direct 2>/dev/null; then
+    if ! unzip -p "$TMP" xray 2>/dev/null | dd of=/usr/local/bin/xray bs=1M conv=fdatasync 2>/dev/null; then
+        echo "Xray 解压失败"
+        rm -f "$TMP" /usr/local/bin/xray
+        exit 1
+    fi
+fi
 
 chmod +x /usr/local/bin/xray
 
 rm -f "$TMP"
+
+# 显式校验解压产物：管道退出码只看 dd，zip 损坏/截断时会写出空文件，必须单独判断
+if [ ! -s /usr/local/bin/xray ]; then
+    echo "Xray 二进制为空（下载或解压不完整）"
+    rm -f /usr/local/bin/xray
+    exit 1
+fi
+if ! xray version >/dev/null 2>&1; then
+    echo "Xray 二进制损坏，无法执行"
+    rm -f /usr/local/bin/xray
+    exit 1
+fi
 
 echo
 echo "Xray 版本:"
 xray version | head -n 1
 echo
 echo -e "${GREEN}Xray 安装完成${RESET}"
+}
+
+
+#############################################
+# 端口选择（避开 Linux 临时端口段 32768-60999）
+#############################################
+
+port_in_use(){
+    # Alpine 可能没有 ss，退回 netstat；都没有就当作空闲（真被占用时服务起不来，Restart 会暴露）
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -q ":$1 "
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | grep -q ":$1 "
+    else
+        return 1
+    fi
+}
+
+pick_port(){
+    local port i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        port=$((10000 + RANDOM % 20000))
+        if ! port_in_use "$port"; then
+            echo "$port"
+            return 0
+        fi
+    done
+    # 10 次都撞上占用就随机交一个，概率极低
+    echo $((10000 + RANDOM % 20000))
 }
 
 
@@ -345,7 +409,7 @@ if [ -f "$BASE_DIR/info" ]; then
     fi
 else
     UUID=$(xray uuid)
-    PORT=$((20000 + RANDOM % 40000))
+    PORT=$(pick_port)
     WS_PATH=$(cat /proc/sys/kernel/random/uuid | cut -d "-" -f1)
 
 cat > "$BASE_DIR/info" <<EOF
@@ -476,9 +540,15 @@ echo
 echo "[5/6] 安装 Cloudflare Tunnel"
 
 if command -v cloudflared >/dev/null 2>&1; then
-    echo "检测到 cloudflared 已安装"
-    cloudflared --version
-    return
+    # 与 xray 同样的完整性校验：残留的可能是下载中断的不完整二进制
+    chmod +x "$(command -v cloudflared)" 2>/dev/null || true
+    if cloudflared --version >/dev/null 2>&1; then
+        echo "检测到 cloudflared 已安装"
+        cloudflared --version
+        return
+    fi
+    echo "检测到残留 cloudflared 二进制损坏，重新安装..."
+    rm -f "$(command -v cloudflared)"
 fi
 
 case $ARCH_NAME in
@@ -494,6 +564,12 @@ echo "下载 cloudflared..."
 curl -fL --retry 5 --connect-timeout 15 "$URL" -o "/usr/local/bin/cloudflared"
 
 chmod +x /usr/local/bin/cloudflared
+
+if ! cloudflared --version >/dev/null 2>&1; then
+    echo "cloudflared 二进制损坏（下载不完整或架构不对）"
+    rm -f /usr/local/bin/cloudflared
+    exit 1
+fi
 
 echo
 cloudflared --version
@@ -640,6 +716,13 @@ check_root
 detect_os
 detect_arch
 detect_init
+
+if [ "$INIT" = "none" ]; then
+    echo
+    echo -e "${RED}未检测到 systemd 或 OpenRC，无法创建系统服务，退出${RESET}"
+    exit 1
+fi
+
 ensure_swap
 install_dependencies
 breathe
