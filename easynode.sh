@@ -4,7 +4,7 @@
 # EasyNode
 # VPS 一键节点部署工具
 #
-# Version: 1.2 (域名守护 + 健壮性加固版)
+# Version: 1.3 (内存挡位自适应 + 健康守护自愈版)
 #################################################
 
 set -e
@@ -15,7 +15,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exit 1
 fi
 
-VERSION="1.2"
+VERSION="1.3"
 
 
 #############################################
@@ -36,6 +36,83 @@ BASE_DIR="/etc/easynode"
 
 # SSH 断开保护：忽略挂断信号（SIGHUP），防止 SSH 断线导致脚本中断
 trap '' HUP
+
+
+#############################################
+# 内存挡位表（核心）
+#
+# 机器内存五花八门，但真实世界里几乎是这几个档：
+#     64M / 128M / 256M / 512M / 1G 及以上
+# 这里按实测内存自动落到对应挡位，并由挡位统一给出
+# xray / cloudflared 的 GOMEMLIMIT + MemoryHigh + MemoryMax。
+#
+# 设计原则（对应 v1.2 的两个线上事故）：
+#  1) 挡位越高给得越宽，不做"算术等比缩放"——1G 以上的机器上
+#     xray 即使空载也要吃十几 MB，硬卡 50M 会被 cgroup OOM 杀掉，
+#     而 OOM 杀人时 anon-rss 往往只有几十 KB，撑爆配额的是
+#     Go 运行时的 file-rss / page cache / 内核账目。
+#  2) MemoryHigh 与 MemoryMax 之间留足余量：MemoryHigh 一旦被
+#     长期顶住，进程会把时间全耗在内存回收上，表现就是
+#     "systemctl status 显示 active，节点却完全不可用"。
+#  3) 1G+ 是"不设上限"挡：不写 MemorySwapMax、不加 CPUQuota，
+#     只是给一个远高于真实工作集的护栏，防止异常暴涨吃光母机。
+#
+# 挡位对应关系（xray 真实工作集约 10-20MB，cloudflared 约 20-45MB）：
+#   机器内存   GOMEMLIMIT(High/Max) xray      cloudflared
+#   64M        24MiB (32M/40M)                28MiB (36M/44M)
+#   128M       36MiB (48M/56M)                40MiB (52M/64M)
+#   256M       56MiB (72M/88M)                60MiB (80M/96M)
+#   512M       96MiB (96M/128M)               64MiB (80M/112M)
+#   1G+        256MiB (256M/384M)             96MiB (128M/256M)
+#############################################
+
+MEM_TIER=""
+XRAY_GOMEMLIMIT=""; XRAY_MEM_HIGH=""; XRAY_MEM_MAX=""
+CF_GOMEMLIMIT="";   CF_MEM_HIGH="";   CF_MEM_MAX=""
+
+select_mem_tier(){
+    # 取实测总内存（MB）：优先 /proc/meminfo（busybox 也一定有），退回 free
+    if [ -r /proc/meminfo ]; then
+        MEM_TOTAL=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    fi
+    [ -z "${MEM_TOTAL:-}" ] && MEM_TOTAL=$(free -m 2>/dev/null | awk '/^Mem:/ {print $2}')
+    [ -z "${MEM_TOTAL:-}" ] && MEM_TOTAL=512
+
+    # 落挡：<=64 → 64；<=128 → 128；<=256 → 256；<=512 → 512；>512 → 1G+
+    if   [ "$MEM_TOTAL" -le 64  ]; then MEM_TIER=64
+    elif [ "$MEM_TOTAL" -le 128 ]; then MEM_TIER=128
+    elif [ "$MEM_TOTAL" -le 256 ]; then MEM_TIER=256
+    elif [ "$MEM_TOTAL" -le 512 ]; then MEM_TIER=512
+    else                                MEM_TIER=1G
+    fi
+
+    case "$MEM_TIER" in
+    64)
+        XRAY_GOMEMLIMIT=24MiB; XRAY_MEM_HIGH=32M; XRAY_MEM_MAX=40M
+        CF_GOMEMLIMIT=28MiB;   CF_MEM_HIGH=36M;   CF_MEM_MAX=44M
+        ;;
+    128)
+        XRAY_GOMEMLIMIT=36MiB; XRAY_MEM_HIGH=48M; XRAY_MEM_MAX=56M
+        CF_GOMEMLIMIT=40MiB;   CF_MEM_HIGH=52M;   CF_MEM_MAX=64M
+        ;;
+    256)
+        XRAY_GOMEMLIMIT=56MiB; XRAY_MEM_HIGH=72M; XRAY_MEM_MAX=88M
+        CF_GOMEMLIMIT=60MiB;   CF_MEM_HIGH=80M;   CF_MEM_MAX=96M
+        ;;
+    512)
+        XRAY_GOMEMLIMIT=96MiB; XRAY_MEM_HIGH=96M; XRAY_MEM_MAX=128M
+        CF_GOMEMLIMIT=64MiB;   CF_MEM_HIGH=80M;   CF_MEM_MAX=112M
+        ;;
+    1G)
+        XRAY_GOMEMLIMIT=256MiB; XRAY_MEM_HIGH=256M; XRAY_MEM_MAX=384M
+        CF_GOMEMLIMIT=96MiB;    CF_MEM_HIGH=128M;   CF_MEM_MAX=256M
+        ;;
+    esac
+
+    echo -e "内存挡位: ${GREEN}${MEM_TIER}${RESET}（实测 ${MEM_TOTAL}MB）"
+    echo -e "  xray        GOMEMLIMIT=${XRAY_GOMEMLIMIT} MemoryHigh=${XRAY_MEM_HIGH} MemoryMax=${XRAY_MEM_MAX}"
+    echo -e "  cloudflared GOMEMLIMIT=${CF_GOMEMLIMIT} MemoryHigh=${CF_MEM_HIGH} MemoryMax=${CF_MEM_MAX}"
+}
 
 
 #############################################
@@ -167,6 +244,9 @@ SWAP_TOTAL=$(free -m 2>/dev/null | awk '/^Swap:/ {print $2}')
 [ -z "$SWAP_TOTAL" ] && SWAP_TOTAL=0
 
 echo -e "内存: ${YELLOW}${MEM_TOTAL}MB${RESET}，Swap: ${YELLOW}${SWAP_TOTAL}MB${RESET}"
+
+# 按实测内存落挡，并由挡位决定 xray / cloudflared 的内存限制（供 [4/6][5/6] 使用）
+select_mem_tier
 
 # 小内存（<=512MB）且 swap 不足（<256MB）→ 尝试创建 swap 防 OOM
 if [ "$MEM_TOTAL" -le 512 ] && [ "$SWAP_TOTAL" -lt 256 ]; then
@@ -514,13 +594,16 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/etc/easynode
-Environment=GOMEMLIMIT=35MiB
+Environment=GOMEMLIMIT=${XRAY_GOMEMLIMIT:-256MiB}
 ExecStart=/usr/local/bin/xray run -config /etc/easynode/config.json
 Restart=always
 RestartSec=5
-MemoryHigh=30M
-MemoryMax=50M
+MemoryHigh=${XRAY_MEM_HIGH:-256M}
+MemoryMax=${XRAY_MEM_MAX:-384M}
 TimeoutStartSec=30
+# 内存卡死时进程可能长时间不响应 SIGTERM；不设此项时 systemd 会干等默认 90s，
+# 表现为"部署卡在创建系统服务" / "卸载卡住不显示日志"。收敛到 15s 超时即 SIGKILL。
+TimeoutStopSec=15
 NoNewPrivileges=true
 CapabilityBoundingSet=
 ProtectSystem=strict
@@ -635,13 +718,15 @@ After=network.target
 [Service]
 Type=simple
 Environment=HOME=/var/lib/easynode-cloudflared
-Environment=GOMEMLIMIT=45MiB
+Environment=GOMEMLIMIT=${CF_GOMEMLIMIT:-96MiB}
 ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:$PORT --no-autoupdate
 Restart=always
 RestartSec=5
-MemoryHigh=40M
-MemoryMax=60M
+MemoryHigh=${CF_MEM_HIGH:-128M}
+MemoryMax=${CF_MEM_MAX:-256M}
 TimeoutStartSec=90
+# 同 xray：避免内存受限时 stop/restart 干等 90s
+TimeoutStopSec=15
 NoNewPrivileges=true
 CapabilityBoundingSet=
 ProtectSystem=strict
@@ -906,6 +991,222 @@ fi
 
 
 #############################################
+# 安装健康守护（end-to-end 自愈）
+#
+# 与 watchdog 的分工：
+#   watchdog        —— 只管"隧道域名变了要同步 node.txt"，不看节点死活
+#   health（本项）  —— 只管"节点到底还能不能用"，看死活并自动恢复
+#
+# 为什么必须有它：systemd 的 Restart=always 只能发现"进程退出"。但线上更多见的是
+# 进程活着却不可用（内存被 MemoryHigh 卡死、隧道 connector 掉线但进程没退），
+# 此时 systemctl status 一片正常，节点却已经死了，没有任何机制会去救。
+#
+# 判定标准（HTTP 404 = xray 对不匹配路径的标准应答）：
+#   本地 127.0.0.1:$PORT  → 404 才算 xray 活
+#   隧道 https://域名/    → 404 才算端到端通（502 = xray 没应答；530 = 隧道掉线）
+#
+# 只恢复不重建：UUID / PORT / WS_PATH 永远从 info 复用，绝不重新生成。
+#############################################
+
+install_health_guard(){
+echo
+echo "安装健康守护（节点自愈）"
+
+cat > /usr/local/bin/easynode-health <<'HEOF'
+#!/bin/bash
+# EasyNode 健康守护：检测"服务在跑但节点不可用"并自动恢复。
+# 只做恢复，不重建：UUID/PORT/WS_PATH 永不改动。
+# 退出码 0 = 健康或已自愈；1 = 仍异常。
+BASE=/etc/easynode
+NODE_FILE=$BASE/node.txt
+INFO=$BASE/info
+STATUS=$BASE/health.json
+[ -f "$NODE_FILE" ] || exit 0          # 未部署 → 静默退出
+[ -f "$INFO" ] || exit 0
+
+log(){ echo "easynode-health: $*"; }
+restart_unit(){ systemctl restart "$1" >/dev/null 2>&1 || true; }
+
+write_status(){
+    # $1=ok/fail  $2=domain  $3=xray_ok  $4=action
+    local st="$1" dom="${2:-}" xo="${3:-0}" act="${4:-none}"
+    umask 077
+    # 注意：分隔符不能叫 EOF —— 本段整体处在外层 <<'HEOF' 里，
+    # 内层若用 EOF 会让 bash 提前结束外层 heredoc，整个脚本语法崩掉。
+    cat > "$STATUS.tmp" 2>/dev/null <<JSONEOF
+{
+  "checked": "$(date '+%Y-%m-%d %H:%M:%S%z')",
+  "status": "$st",
+  "domain": "$dom",
+  "xray_local_ok": $xo,
+  "action": "$act",
+  "xray_restarts": $(systemctl show easynode-xray -p NRestarts --value 2>/dev/null || echo 0),
+  "cloudflared_restarts": $(systemctl show easynode-cloudflared -p NRestarts --value 2>/dev/null || echo 0),
+  "xray_mem_peak": $(cat /sys/fs/cgroup/system.slice/easynode-xray.service/memory.peak 2>/dev/null || echo 0),
+  "cloudflared_mem_peak": $(cat /sys/fs/cgroup/system.slice/easynode-cloudflared.service/memory.peak 2>/dev/null || echo 0)
+}
+JSONEOF
+    mv -f "$STATUS.tmp" "$STATUS" 2>/dev/null || true
+}
+
+. "$INFO"
+PORT=${PORT:-0}
+WS_PATH=${WS_PATH:-}
+[ "$PORT" != 0 ] || exit 0
+
+ACTION="none"
+
+# ---- 1. xray：本地回环端口必须有人应答 ----
+xray_ok=0
+for i in 1 2 3; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+    [ "$code" = "404" ] && { xray_ok=1; break; }
+    sleep 1
+done
+if [ "$xray_ok" != 1 ]; then
+    log "xray 未应答（code=${code:-无}），重启 easynode-xray"
+    restart_unit easynode-xray
+    ACTION="restart-xray"
+    sleep 6
+    for i in 1 2 3; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/" 2>/dev/null || true)
+        [ "$code" = "404" ] && { xray_ok=1; break; }
+        sleep 2
+    done
+    [ "$xray_ok" = 1 ] && log "xray 已恢复" || log "xray 重启后仍未应答"
+fi
+
+# ---- 2. 取当前隧道域名（日志里最后一次出现的即为当前隧道）----
+get_dom(){
+    local d=""
+    if command -v journalctl >/dev/null 2>&1; then
+        d=$(journalctl -u easynode-cloudflared -n 500 --no-pager 2>/dev/null \
+            | grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' | tail -n1)
+    fi
+    if [ -z "$d" ] && [ -f /var/log/easynode-cloudflared.log ]; then
+        d=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' /var/log/easynode-cloudflared.log 2>/dev/null | tail -n1)
+    fi
+    echo "${d#https://}"
+}
+DOM=$(get_dom)
+
+# ---- 3. cloudflared：隧道必须端到端可达 ----
+if [ -z "$DOM" ]; then
+    log "日志中找不到隧道域名，重启 easynode-cloudflared"
+    restart_unit easynode-cloudflared
+    ACTION="restart-cloudflared"
+    sleep 15
+    DOM=$(get_dom)
+else
+    tun_ok=0
+    for i in 1 2 3; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$DOM/" 2>/dev/null || true)
+        [ "$code" = "404" ] && { tun_ok=1; break; }
+        sleep 3
+    done
+    if [ "$tun_ok" != 1 ]; then
+        log "隧道不可用（https://$DOM/ -> code=${code:-无}），重启 easynode-cloudflared"
+        restart_unit easynode-cloudflared
+        ACTION="restart-cloudflared"
+        sleep 20
+        DOM=$(get_dom)
+    fi
+fi
+
+[ -n "$DOM" ] || { log "仍无法取得隧道域名"; write_status fail "" "$xray_ok" "$ACTION"; exit 1; }
+
+# ---- 4. 同步 node.txt（只换域名，UUID/PORT/WS_PATH 复用）----
+OLD=""
+[ -f "$NODE_FILE" ] && OLD=$(sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p' "$NODE_FILE" 2>/dev/null)
+if [ "$OLD" != "$DOM" ]; then
+    NODE="vless://$UUID@$DOM:443?encryption=none&security=tls&type=ws&host=$DOM&path=%2F$WS_PATH#easynode"
+    umask 077
+    printf '%s\n' "$NODE" > "$NODE_FILE.tmp" 2>/dev/null && mv -f "$NODE_FILE.tmp" "$NODE_FILE"
+    printf 'domain=%s\nupdated=%s\n' "$DOM" "$(date '+%Y-%m-%d %H:%M:%S')" > "$BASE/tunnel.meta.tmp" 2>/dev/null && mv -f "$BASE/tunnel.meta.tmp" "$BASE/tunnel.meta"
+    log "隧道域名变化: $OLD -> $DOM，已更新 node.txt（客户端重新导入一次即可）"
+    [ "$ACTION" = "none" ] && ACTION="sync-domain"
+fi
+
+# ---- 5. 复检 ----
+sleep 2
+FINAL=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$DOM/" 2>/dev/null || true)
+if [ "$FINAL" = "404" ]; then
+    log "复检通过：https://$DOM/ -> 404"
+    write_status ok "$DOM" "$xray_ok" "$ACTION"
+    exit 0
+fi
+log "复检未通过：https://$DOM/ -> code=${FINAL:-无}"
+write_status fail "$DOM" "$xray_ok" "$ACTION"
+exit 1
+HEOF
+chmod 700 /usr/local/bin/easynode-health
+
+if [ "$INIT" = "openrc" ]; then
+    # OpenRC：复用 watchdog 那套常驻循环的做法（部分精简 Alpine 没有 crond init 脚本）
+    sed -i '/easynode-health/d' /etc/crontabs/root 2>/dev/null || true
+cat > /usr/local/bin/easynode-health-loop <<'LEOF'
+#!/bin/sh
+# EasyNode 健康守护常驻循环：每 60 秒端到端自检一次
+while true; do
+    /usr/local/bin/easynode-health >/dev/null 2>&1 || true
+    sleep 60
+done
+LEOF
+    chmod 700 /usr/local/bin/easynode-health-loop
+
+cat >/etc/init.d/easynode-health <<'EOF'
+#!/sbin/openrc-run
+name="easynode-health"
+description="EasyNode Health Guard (end-to-end self-healing)"
+supervisor="supervise-daemon"
+command="/usr/local/bin/easynode-health-loop"
+pidfile="/run/easynode-health.pid"
+EOF
+    chmod +x /etc/init.d/easynode-health
+
+    if rc-update add easynode-health default >/dev/null 2>&1 && rc-service easynode-health restart >/dev/null 2>&1; then
+        echo -e "${GREEN}健康守护已启用（常驻循环每 60 秒自检一次，节点不可用会自动恢复）${RESET}"
+    else
+        echo -e "${YELLOW}⚠️ 健康守护启动失败，节点异常时需手工 systemctl/rc-service 重启${RESET}"
+    fi
+else
+cat >/etc/systemd/system/easynode-health.service <<'EOF'
+[Unit]
+Description=EasyNode Health Guard (end-to-end self-healing)
+After=easynode-xray.service easynode-cloudflared.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/easynode-health
+EOF
+
+cat >/etc/systemd/system/easynode-health.timer <<'EOF'
+[Unit]
+Description=Run EasyNode Health Guard every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=easynode-health.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    if systemctl enable --now easynode-health.timer >/dev/null 2>&1; then
+        echo -e "${GREEN}健康守护已启用（timer 每 1 分钟自检一次，节点不可用会自动恢复）${RESET}"
+    else
+        echo -e "${YELLOW}⚠️ 健康守护 timer 启用失败，节点异常时需手工 systemctl restart${RESET}"
+    fi
+fi
+
+echo -e "  状态文件: ${YELLOW}${BASE_DIR}/health.json${RESET}"
+}
+
+
+#############################################
 # 主流程
 #############################################
 
@@ -936,6 +1237,7 @@ create_cloudflared_service
 get_tunnel_domain
 generate_node
 install_watchdog
+install_health_guard
 verify_tunnel
 
 echo
@@ -953,9 +1255,24 @@ else
     echo "- systemctl list-timers easynode-watchdog.timer"
 fi
 echo
+echo "健康守护（节点不可用会自动恢复）:"
+if [ "$INIT" = "openrc" ]; then
+    echo "- health 常驻循环每 60 秒自检（rc-service easynode-health status）"
+else
+    echo "- systemctl list-timers easynode-health.timer"
+fi
+echo "- 状态文件: /etc/easynode/health.json"
+echo "- 手动执行一次: /usr/local/bin/easynode-health"
+echo
+echo "内存挡位:"
+echo "- 实测 ${MEM_TOTAL}MB → 挡位 ${MEM_TIER}"
+echo "- xray: MemoryHigh=$XRAY_MEM_HIGH MemoryMax=$XRAY_MEM_MAX"
+echo "- cloudflared: MemoryHigh=$CF_MEM_HIGH MemoryMax=$CF_MEM_MAX"
+echo
 echo "节点保存:"
 echo "/etc/easynode/node.txt"
 echo "（隧道/机器重启后域名会变，watchdog 会自动更新该文件，客户端重新导入一次即可）"
+echo "（只重启 xray 不会换域名；只有 cloudflared 重启才会换域名）"
 echo "===================================="
 }
 
@@ -990,13 +1307,17 @@ else
     systemctl stop easynode-xray.service easynode-cloudflared.service >/dev/null 2>&1 || true
     systemctl disable easynode-xray.service easynode-cloudflared.service >/dev/null 2>&1 || true
     systemctl disable --now easynode-watchdog.timer >/dev/null 2>&1 || true
+    # 先停健康守护：否则卸载中途它可能把已停掉的 xray 又拉起来
+    systemctl disable --now easynode-health.timer >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/easynode-xray.service /etc/systemd/system/easynode-cloudflared.service
     rm -f /etc/systemd/system/easynode-watchdog.service /etc/systemd/system/easynode-watchdog.timer
+    rm -f /etc/systemd/system/easynode-health.service /etc/systemd/system/easynode-health.timer
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 
-# 1.5 停掉可能正在执行的 watchdog，防止卸载过程中又写一次 node.txt
+# 1.5 停掉可能正在执行的 watchdog / health，防止卸载过程中又写一次 node.txt
 pkill -f "easynode-watchdog" >/dev/null 2>&1 || true
+pkill -f "easynode-health"   >/dev/null 2>&1 || true
 
 # 2. 杀掉残留进程
 pkill -f "/usr/local/bin/xray" >/dev/null 2>&1 || true
@@ -1005,6 +1326,7 @@ pkill -f "/usr/local/bin/cloudflared" >/dev/null 2>&1 || true
 # 3. 删除二进制与守护
 rm -f /usr/local/bin/xray /usr/local/bin/cloudflared
 rm -f /usr/local/bin/easynode-watchdog /usr/local/bin/easynode-watchdog-loop
+rm -f /usr/local/bin/easynode-health /usr/local/bin/easynode-health-loop
 rm -rf /var/lib/easynode-cloudflared
 rm -f /var/log/easynode-cloudflared.log
 
@@ -1024,7 +1346,8 @@ echo
 echo "已清理："
 echo "  - 系统服务（easynode-xray / easynode-cloudflared）"
 echo "  - 域名守护（watchdog 脚本与常驻循环 / systemd timer 或 OpenRC 服务 / tunnel.meta）"
-echo "  - 二进制（/usr/local/bin/xray / cloudflared / easynode-watchdog / easynode-watchdog-loop）"
+echo "  - 健康守护（easynode-health 脚本与常驻循环 / systemd timer 或 OpenRC 服务 / health.json）"
+echo "  - 二进制（/usr/local/bin/xray / cloudflared / easynode-watchdog / easynode-watchdog-loop / easynode-health / easynode-health-loop）"
 echo "  - 配置目录（/etc/easynode）"
 echo "  - cloudflared 状态目录（/var/lib/easynode-cloudflared）"
 echo "  - cloudflared 日志（/var/log/easynode-cloudflared.log，如有）"
@@ -1033,9 +1356,32 @@ echo
 }
 
 
+#############################################
+# 只安装/重装健康守护（给已经用 v1.2 部署好的机器补上自愈能力）
+# 用法： curl -fsSL <脚本地址> | bash -s -- health
+#############################################
+
+install_health_only(){
+show_logo
+check_root
+detect_init
+[ "$INIT" = "none" ] && { echo -e "${RED}未检测到 systemd 或 OpenRC，退出${RESET}"; exit 1; }
+[ -f "$BASE_DIR/info" ] || { echo -e "${RED}未检测到 $BASE_DIR/info，请先正常部署一次${RESET}"; exit 1; }
+select_mem_tier
+install_health_guard
+echo
+echo "健康守护安装完成。查看状态："
+echo "  systemctl list-timers easynode-health.timer   # 或 rc-service easynode-health status"
+echo "  cat $BASE_DIR/health.json"
+}
+
+
 case "${1:-}" in
     uninstall|remove|delete)
         uninstall
+        ;;
+    health|health-guard|guard)
+        install_health_only
         ;;
     *)
         main

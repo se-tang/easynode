@@ -1,0 +1,6 @@
+# 保证在 Windows 上 checkout/clone 也不会把 LF 变成 CRLF。
+# easynode.sh 是要在 Linux 上执行的 bash 脚本，一旦混入 CRLF 会直接报
+# "bash: $'\r': command not found"，因此这里强制 LF。
+* text=auto eol=lf
+*.sh text eol=lf
+*.md text eol=lf
