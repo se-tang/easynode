@@ -1399,6 +1399,24 @@ echo "  cat $BASE_DIR/health.json"
 }
 
 
+#############################################
+# 防误触保护：被 source 且没带参数时，只提供函数定义，不执行部署
+#
+# 为什么需要：`source easynode.sh`（没有位置参数）会让下面的 case 落到
+# * 分支直接执行 main —— 那等于在真实机器上跑了一次完整部署：会重启
+# tunnel（换域名）、覆盖 /etc/easynode 的 info/config.json。做测试时
+# 极易误伤线上节点。放在这里（所有函数定义之后）既能拦住 main，
+# 又保留 select_mem_tier / create_service 等函数供测试调用。
+#############################################
+
+if [ "${BASH_SOURCE[0]}" != "$0" ] && [ "$#" -eq 0 ]; then
+    echo "easynode.sh 已被 source：只加载函数定义，未执行部署。"
+    echo "  要真正部署请直接执行： bash easynode.sh"
+    echo "  测挡位请参考 README 的挡位表（select_mem_tier 每次都读 /proc/meminfo）"
+    return 0
+fi
+
+
 case "${1:-}" in
     uninstall|remove|delete)
         uninstall
