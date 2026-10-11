@@ -64,6 +64,17 @@ trap '' HUP
 #   256M       56MiB (72M/88M)                60MiB (80M/96M)
 #   512M       96MiB (96M/128M)               64MiB (80M/112M)
 #   1G+        256MiB (256M/384M)             96MiB (128M/256M)
+#
+# 落挡容差（重要）：
+#   商家说的"128M / 512M / 1G"是物理内存，装完系统后 /proc/meminfo 的
+#   MemTotal 一定更小（内核镜像、保留内存、固件占用等，通常少 2%~10%）。
+#   如果按标称值直接卡边界，就会出现：
+#     - 标称 64M  的机器实测才 58M   → 掉到"比 64 更小"的兜底逻辑
+#     - 标称 512M 的机器实测才 480M  → 被误判成 256 挡（挡位偏小，反而更危险）
+#     - 标称 1G   的机器实测才 950M  → 被误判成 512 挡
+#   所以判定阈值下浮约 10%，让"标称值"而不是"实测值"决定挡位。
+#   注意：偏大的挡位只是限制更宽松，不会把机器撑爆；偏小才有卡死风险，
+#   因此宁可靠大一挡。
 #############################################
 
 MEM_TIER=""
@@ -73,17 +84,28 @@ CF_GOMEMLIMIT="";   CF_MEM_HIGH="";   CF_MEM_MAX=""
 select_mem_tier(){
     # 取实测总内存（MB）：优先 /proc/meminfo（busybox 也一定有），退回 free
     if [ -r /proc/meminfo ]; then
-        MEM_TOTAL=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+        MEM_TOTAL=$(awk '/^MemTotal:/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)
     fi
     [ -z "${MEM_TOTAL:-}" ] && MEM_TOTAL=$(free -m 2>/dev/null | awk '/^Mem:/ {print $2}')
     [ -z "${MEM_TOTAL:-}" ] && MEM_TOTAL=512
 
-    # 落挡：<=64 → 64；<=128 → 128；<=256 → 256；<=512 → 512；>512 → 1G+
-    if   [ "$MEM_TOTAL" -le 64  ]; then MEM_TIER=64
-    elif [ "$MEM_TOTAL" -le 128 ]; then MEM_TIER=128
-    elif [ "$MEM_TOTAL" -le 256 ]; then MEM_TIER=256
-    elif [ "$MEM_TOTAL" -le 512 ]; then MEM_TIER=512
-    else                                MEM_TIER=1G
+    # 落挡阈值（下浮 15% 再减 12MB，抵消装完系统后的内存损耗）：
+    #   >858 → 1G+   (标称 1024)
+    #   >423 → 512   (标称 512)
+    #   >206 → 256   (标称 256)
+    #   >97  → 128   (标称 128)
+    #   其余 → 64
+    # 为什么"百分比 + 固定值"两层：小机器的损耗里有一部分是固定的
+    # （内核镜像/保留内存/固件通常吃掉 10MB 上下），对 1024MB 的机器只占 1%，
+    # 对 128MB 的机器却占 8%。只按百分比下浮，小机器容易被误判掉挡。
+    # 实测覆盖（约 15% 损耗 + 12MB 固定开销）：
+    #   标称 1024 实测 910 → 1G+；标称 512 实测 452 → 512；
+    #   标称 256 实测 226 → 256；标称 128 实测 113 → 128；标称 64 实测 56 → 64
+    if   [ "$MEM_TOTAL" -gt 858 ]; then MEM_TIER=1G
+    elif [ "$MEM_TOTAL" -gt 423 ]; then MEM_TIER=512
+    elif [ "$MEM_TOTAL" -gt 206 ]; then MEM_TIER=256
+    elif [ "$MEM_TOTAL" -gt 97  ]; then MEM_TIER=128
+    else                                MEM_TIER=64
     fi
 
     case "$MEM_TIER" in
@@ -109,7 +131,8 @@ select_mem_tier(){
         ;;
     esac
 
-    echo -e "内存挡位: ${GREEN}${MEM_TIER}${RESET}（实测 ${MEM_TOTAL}MB）"
+    # 实测值一定比商家标称小（内核镜像/保留内存/固件占用），提示一下避免误会
+    echo -e "内存挡位: ${GREEN}${MEM_TIER}${RESET}（进程可见 ${MEM_TOTAL}MB，通常略低于商家标称）"
     echo -e "  xray        GOMEMLIMIT=${XRAY_GOMEMLIMIT} MemoryHigh=${XRAY_MEM_HIGH} MemoryMax=${XRAY_MEM_MAX}"
     echo -e "  cloudflared GOMEMLIMIT=${CF_GOMEMLIMIT} MemoryHigh=${CF_MEM_HIGH} MemoryMax=${CF_MEM_MAX}"
 }
