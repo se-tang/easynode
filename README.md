@@ -19,17 +19,40 @@ curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh |
 
 跑完会输出一条 `vless://` 链接，导入客户端（v2rayN / v2rayNG / Shadowrocket 等）即可。链接同时保存在 `/etc/easynode/node.txt`。
 
-> Alpine 需先 `apk add bash`。
+> Alpine 需先 `apk add bash`。卸载、补装健康守护等命令见下面「常用命令」。
 
 ## 常用命令
 
-| 操作 | 命令 |
-|:--|:--|
-| 部署 | 上面的快速开始 |
-| 换节点 | 重跑部署命令（UUID/端口/路径不变，只换隧道域名） |
-| 看当前链接 | `cat /etc/easynode/node.txt` |
-| 看健康状态 | `cat /etc/easynode/health.json` |
-| 卸载 | `curl -fsSL <脚本地址> \| bash -s -- uninstall` |
+下面每条都是**完整可直接复制**的（在目标机器上以 root 执行）。
+
+**① 一键部署**（首次安装 / 想重新生成节点都跑它）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh | bash
+```
+
+**② 一键卸载**（删掉服务、二进制、配置、swap，不留痕迹）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh | bash -s -- uninstall
+```
+
+**③ 只补装健康守护**（老版本部署过的机器，不想重装时用）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/se-tang/easynode/main/easynode.sh | bash -s -- health
+```
+
+**④ 查看与排查**
+
+```bash
+cat /etc/easynode/node.txt          # 当前节点链接
+cat /etc/easynode/health.json       # 健康守护自检结果
+systemctl status easynode-xray easynode-cloudflared
+```
+
+> 换节点直接重跑 ①：UUID / 端口 / 路径都不变，只换隧道域名。
+> 想先看脚本内容再执行，把 `| bash` 换成 `-o easynode.sh` 下载下来看，确认后再 `bash easynode.sh`。
 
 ## 特性
 
