@@ -1400,22 +1400,20 @@ echo "  cat $BASE_DIR/health.json"
 
 
 #############################################
-# 防误触保护：被 source 且没带参数时，只提供函数定义，不执行部署
+# ⚠️ 请不要 source 本脚本（重要）
 #
-# 为什么需要：`source easynode.sh`（没有位置参数）会让下面的 case 落到
-# * 分支直接执行 main —— 那等于在真实机器上跑了一次完整部署：会重启
-# tunnel（换域名）、覆盖 /etc/easynode 的 info/config.json。做测试时
-# 极易误伤线上节点。放在这里（所有函数定义之后）既能拦住 main，
-# 又保留 select_mem_tier / create_service 等函数供测试调用。
+# `source easynode.sh` / `. easynode.sh`（不带参数）会让下面的 case 落到
+# * 分支，等于在真实机器上跑一次完整部署：重启 tunnel（换域名）、覆盖
+# /etc/easynode 的 info / config.json。做函数级测试请到容器/临时机器里做。
+#
+# v1.3.0 曾在这里加过一个"被 source 就自动跳过"的守卫，结果把 README 的
+# `curl -fsSL ... | bash` 一起拦掉了，导致完全装不上（已回滚）。
+# 根因是 bash 里 `bash easynode.sh` 与 `source easynode.sh` 无法可靠区分：
+#     bash 文件执行 : $0=/path/easynode.sh   BASH_SOURCE[0]=同值
+#     source 载入   : $0=/path/easynode.sh   BASH_SOURCE[0]=同值   <- 完全相同
+#     curl | bash   : $0=bash                BASH_SOURCE[0]=空
+# 所以任何"能拦住 source"的判断都会同时拦住正常执行。这个守卫不要再加了。
 #############################################
-
-if [ "${BASH_SOURCE[0]}" != "$0" ] && [ "$#" -eq 0 ]; then
-    echo "easynode.sh 已被 source：只加载函数定义，未执行部署。"
-    echo "  要真正部署请直接执行： bash easynode.sh"
-    echo "  测挡位请参考 README 的挡位表（select_mem_tier 每次都读 /proc/meminfo）"
-    return 0
-fi
-
 
 case "${1:-}" in
     uninstall|remove|delete)
