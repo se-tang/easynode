@@ -4,7 +4,7 @@
 # EasyNode
 # VPS 一键节点部署工具
 #
-# Version: 1.3.1 (内存挡位自适应 + 健康守护自愈版)
+# Version: 1.3.2 (域名持久化 + 内存挡位自适应 + 健康守护自愈版)
 #################################################
 
 set -e
@@ -15,7 +15,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exit 1
 fi
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 
 #############################################
@@ -831,6 +831,11 @@ chmod 600 "$BASE_DIR/node.txt"
 printf 'domain=%s\nupdated=%s\n' "$DOMAIN" "$(date '+%Y-%m-%d %H:%M:%S')" > "$BASE_DIR/tunnel.meta"
 chmod 600 "$BASE_DIR/tunnel.meta"
 
+# 权威域名文件：健康守护/watchdog 优先从这里读域名，不依赖会被轮转的日志
+umask 077
+printf '%s\n' "$DOMAIN" > "$BASE_DIR/tunnel.domain"
+chmod 600 "$BASE_DIR/tunnel.domain"
+
 echo
 echo "=============================="
 echo "EasyNode 部署完成"
@@ -891,6 +896,7 @@ cat > /usr/local/bin/easynode-watchdog <<'WEOF'
 BASE_DIR="/etc/easynode"
 NODE_FILE="$BASE_DIR/node.txt"
 META_FILE="$BASE_DIR/tunnel.meta"
+DOMAIN_FILE="$BASE_DIR/tunnel.domain"
 CF_LOG="/var/log/easynode-cloudflared.log"
 
 # 未部署或已卸载 → 静默退出
@@ -909,18 +915,29 @@ if [ -f "$CF_LOG" ]; then
     fi
 fi
 
-# 取当前域名：journal / 日志里"最后一次出现"的 trycloudflare URL 即当前隧道
-# （quick tunnel 每次 start 打印一次 URL，tail -1 天然等于现值，无需时间窗；
-#   部署期 get_tunnel_domain 用的是时间窗方案，两者场景不同，正则需保持一致）
-DOMAIN=""
-if command -v journalctl >/dev/null 2>&1; then
-    DOMAIN=$(journalctl -u easynode-cloudflared -n 500 --no-pager 2>/dev/null | grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' | tail -n1)
-fi
-if [ -z "$DOMAIN" ] && [ -f "$CF_LOG" ]; then
-    DOMAIN=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | tail -n1)
+# 取当前域名：优先读持久化文件，其次才查日志。
+#
+# 为什么不能只靠日志：本机这类 podman 负载重的机器，journald 大约每 2 小时
+# 就轮转一次（SystemMaxUse=200M、单文件 40M），而 cloudflared 的域名横幅
+# 只在启动时打一次 —— 隧道跑几十小时后那行会被轮转掉，
+# `journalctl -u easynode-cloudflared | grep trycloudflare` 就会返回空。
+# 2026-10-13 的健康守护事故正是由此引发（误判隧道已死并重启 cloudflared，
+# 导致域名变化、客户端 SNI 失效）。所以域名必须落在独立文件里。
+DOMAIN=$(cat "$DOMAIN_FILE" 2>/dev/null || true)
+if [ -z "$DOMAIN" ]; then
+    if command -v journalctl >/dev/null 2>&1; then
+        DOMAIN=$(journalctl -u easynode-cloudflared -n 500 --no-pager 2>/dev/null | grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' | tail -n1)
+    fi
+    if [ -z "$DOMAIN" ] && [ -f "$CF_LOG" ]; then
+        DOMAIN=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | tail -n1)
+    fi
 fi
 [ -n "$DOMAIN" ] || exit 0
 DOMAIN=${DOMAIN#https://}
+# 补写域名文件（幂等）
+umask 077
+printf '%s\n' "$DOMAIN" > "$DOMAIN_FILE" 2>/dev/null || true
+chmod 600 "$DOMAIN_FILE" 2>/dev/null || true
 
 # 域名没变 → 静默退出
 OLD_DOMAIN=$(sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p' "$NODE_FILE" 2>/dev/null)
@@ -1044,6 +1061,7 @@ BASE=/etc/easynode
 NODE_FILE=$BASE/node.txt
 INFO=$BASE/info
 STATUS=$BASE/health.json
+DOMAIN_FILE=$BASE/tunnel.domain
 [ -f "$NODE_FILE" ] || exit 0          # 未部署 → 静默退出
 [ -f "$INFO" ] || exit 0
 
@@ -1099,10 +1117,13 @@ if [ "$xray_ok" != 1 ]; then
     [ "$xray_ok" = 1 ] && log "xray 已恢复" || log "xray 重启后仍未应答"
 fi
 
-# ---- 2. 取当前隧道域名（日志里最后一次出现的即为当前隧道）----
+# ---- 2. 取当前隧道域名：优先持久化文件，其次才查日志 ----
+# 关键：日志会被 journald 轮转掉（本机约 2 小时一次），只靠日志拿域名会拿到空值，
+# 进而误判"隧道已死"。域名文件不会轮转。
 get_dom(){
     local d=""
-    if command -v journalctl >/dev/null 2>&1; then
+    d=$(cat "$DOMAIN_FILE" 2>/dev/null || true)
+    if [ -z "$d" ] && command -v journalctl >/dev/null 2>&1; then
         d=$(journalctl -u easynode-cloudflared -n 500 --no-pager 2>/dev/null \
             | grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' | tail -n1)
     fi
@@ -1111,32 +1132,45 @@ get_dom(){
     fi
     echo "${d#https://}"
 }
+
+# 探测隧道是否端到端可用（HTTP 404 = 通）
+probe_dom(){
+    local d="$1" c=""
+    [ -n "$d" ] || return 1
+    for i in 1 2 3; do
+        c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$d/" 2>/dev/null || true)
+        [ "$c" = "404" ] && return 0
+        sleep 3
+    done
+    return 1
+}
+
 DOM=$(get_dom)
 
 # ---- 3. cloudflared：隧道必须端到端可达 ----
-if [ -z "$DOM" ]; then
-    log "日志中找不到隧道域名，重启 easynode-cloudflared"
+# 注意：拿不到域名 ≠ 隧道坏了。只有"探测确实失败"或"连候选域名都没有"才重启。
+if [ -n "$DOM" ] && probe_dom "$DOM"; then
+    umask 077
+    printf '%s\n' "$DOM" > "$DOMAIN_FILE" 2>/dev/null || true
+    chmod 600 "$DOMAIN_FILE" 2>/dev/null || true
+else
+    if [ -n "$DOM" ]; then
+        log "隧道不可用（https://$DOM/ 探测失败），重启 easynode-cloudflared"
+    else
+        log "无法确认隧道域名（日志可能已轮转、域名文件缺失），重启 easynode-cloudflared 以取得域名"
+    fi
     restart_unit easynode-cloudflared
     ACTION="restart-cloudflared"
-    sleep 15
+    sleep 20
     DOM=$(get_dom)
-else
-    tun_ok=0
-    for i in 1 2 3; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$DOM/" 2>/dev/null || true)
-        [ "$code" = "404" ] && { tun_ok=1; break; }
-        sleep 3
-    done
-    if [ "$tun_ok" != 1 ]; then
-        log "隧道不可用（https://$DOM/ -> code=${code:-无}），重启 easynode-cloudflared"
-        restart_unit easynode-cloudflared
-        ACTION="restart-cloudflared"
-        sleep 20
-        DOM=$(get_dom)
-    fi
 fi
 
 [ -n "$DOM" ] || { log "仍无法取得隧道域名"; write_status fail "" "$xray_ok" "$ACTION"; exit 1; }
+
+# 记录权威域名
+umask 077
+printf '%s\n' "$DOM" > "$DOMAIN_FILE" 2>/dev/null || true
+chmod 600 "$DOMAIN_FILE" 2>/dev/null || true
 
 # ---- 4. 同步 node.txt（只换域名，UUID/PORT/WS_PATH 复用）----
 OLD=""

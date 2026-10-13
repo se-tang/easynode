@@ -1,0 +1,47 @@
+#!/bin/bash
+# ============================================================
+# EasyNode 生成优选域名节点（cf.090227.xyz 这类套 CF 的用法）
+#
+# 背景：Quick Tunnel 的域名会随 cloudflared 会话变化，而客户端里写死的
+# SNI / host 不会自己变 —— 所以每次换域名都得手改一遍配置。
+# 这个脚本把"隧道域名"和"优选域名"拼成节点链接写到 node-opt.txt，
+# 换域名后重新执行（或由定时器自动执行）即可拿到最新链接。
+#
+# 用法：
+#   easynode-opt-node                      # 用默认优选域名
+#   easynode-opt-node cf.090227.xyz        # 指定优选域名
+#   OPT_DOMAIN=xxx.com easynode-opt-node   # 环境变量方式
+# ============================================================
+set -u
+BASE=/etc/easynode
+INFO=$BASE/info
+NODE=$BASE/node.txt
+OUT=$BASE/node-opt.txt
+
+# 优选域名：参数 > 环境变量 > 记录的上次值 > 默认
+DEF_OPT="cf.090227.xyz"
+[ -f "$BASE/opt-domain" ] && DEF_OPT=$(cat "$BASE/opt-domain" 2>/dev/null || echo "$DEF_OPT")
+OPT="${1:-${OPT_DOMAIN:-$DEF_OPT}}"
+[ -n "$OPT" ] || { echo "需要指定优选域名" >&2; exit 1; }
+
+[ -f "$INFO" ] || { echo "未部署（缺 $INFO）" >&2; exit 1; }
+[ -f "$NODE" ] || { echo "未部署（缺 $NODE）" >&2; exit 1; }
+. "$INFO"
+
+# 当前隧道域名：直接取自 node.txt（watchdog / health 会持续维护它）
+TUNNEL=$(sed -n 's|^vless://[^@]*@\([^:]*\):.*|\1|p' "$NODE" 2>/dev/null)
+[ -n "$TUNNEL" ] || { echo "无法从 node.txt 解析隧道域名" >&2; exit 1; }
+
+umask 077
+printf '%s\n' "$OPT" > "$BASE/opt-domain"
+
+# 优选域名节点：TCP 连优选域名，SNI/Host 用当前隧道域名
+LINE="vless://${UUID}@${OPT}:443?encryption=none&security=tls&sni=${TUNNEL}&type=ws&host=${TUNNEL}&path=%2F${WS_PATH}#EasyNode-CF"
+
+printf '%s\n' "$LINE" > "$OUT"
+chmod 600 "$OUT"
+
+# 同时刷新一个带时间戳的记录，便于对照
+printf 'tunnel=%s\nopt=%s\nupdated=%s\n' "$TUNNEL" "$OPT" "$(date '+%Y-%m-%d %H:%M:%S')" > "$BASE/opt-meta"
+
+echo "$LINE"

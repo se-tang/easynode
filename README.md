@@ -71,7 +71,11 @@ Debian / Ubuntu / Alpine（Alpine 需 bash） · amd64 / arm64 · 内存 64MB �
 不会。自愈只做"重启服务"和"域名变化时重写 node.txt"，UUID / 端口 / 路径永远是原来那套。
 
 **隧道域名能固定吗？**
-不能。Quick Tunnel 是临时隧道，cloudflared 每次重启域名都会变（脚本会在 1~3 分钟内自动同步到 `node.txt`，但客户端要重新导入一次）。要固定域名需要 Cloudflare 命名 Tunnel，得有自己托管的域名。
+不能。Quick Tunnel 是临时隧道，cloudflared 每次重启（含机器重启、服务重启）域名都会变。脚本会把当前域名持久化到 `/etc/easynode/tunnel.domain` 并同步进 `node.txt`。
+
+> **用优选域名套 CF 的话**（节点指向 `cf.xxx.xyz` 这类优选 IP、拿隧道域名当 SNI/host）：换域名后 SNI 和 host 都得跟着改。执行 `/usr/local/bin/easynode-opt-node` 会按当前域名重新生成带优选域名的完整节点，写入 `/etc/easynode/node-opt.txt`（已配 timer 每 5 分钟自动刷新）。
+>
+> 想彻底免维护只能换 Cloudflare 命名 Tunnel（需要自己托管的域名）。
 
 **需要开放端口吗？**
 不需要，全程出站。
